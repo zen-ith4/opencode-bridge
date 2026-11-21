@@ -15,9 +15,10 @@
   const btnNewChat = document.getElementById("btnNewChat");
   const btnRetry = document.getElementById("btnRetry");
   const statusEl = document.getElementById("status");
+  const modelSelect = document.getElementById("modelSelect");
   const composer = document.getElementById("composer");
 
-  if (!messagesEl || !inputEl || !btnSend || !composer) {
+  if (!messagesEl || !inputEl || !btnSend || !composer || !modelSelect) {
     console.error("OpenCode Bridge: required DOM elements missing");
     return;
   }
@@ -25,6 +26,7 @@
   let currentSessionID = null;
   let streamingMessageEl = null;
   let streamingText = "";
+  let availableModels = []; // { id, label, providerID, modelID }
 
   /* ---------- Escape HTML ---------- */
   function escapeHtml(text) {
@@ -37,26 +39,28 @@
       .replace(/'/g, "&#039;");
   }
 
+  function escapeHtmlAttr(text) {
+    return String(text)
+      .replace(/"/g, "&quot;")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
   /* ---------- Minimal Markdown renderer ---------- */
   function renderMarkdown(text) {
     if (typeof text !== "string") text = "";
-    // Split on fenced code blocks.
     const parts = text.split(/```([\s\S]*?)```/g);
     let html = "";
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i];
-      if (i % 4 === 1) {
-        // Language is in parts[i+?] -> actually split captures groups at odd
-        // indices: [text, lang, code, lang2, code2, ...]
-        continue;
-      }
+      if (i % 4 === 1) continue; // language group
       if (i % 4 === 2) {
         const lang = (parts[i - 1] || "").trim();
         const code = part;
         html += renderCodeBlock(lang, code);
         continue;
       }
-      // Inline markdown for normal text.
       html += renderInline(part);
     }
     return html;
@@ -75,28 +79,49 @@
 </div>`;
   }
 
-  // Escape for use inside an HTML attribute (data-code).
-  function escapeHtmlAttr(text) {
-    return String(text).replace(/"/g, "&quot;").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
-
   function renderInline(text) {
     let out = escapeHtml(text);
-    // Bold **text**
     out = out.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-    // Italic *text*
     out = out.replace(/\*(.+?)\*/g, "<em>$1</em>");
-    // Inline code `text`
     out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
-    // Links [text](url)
     out = out.replace(
       /\[([^\]]+)\]\(([^)]+)\)/g,
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
     );
-    // Line breaks
     out = out.replace(/\n/g, "<br>");
     return out;
   }
+
+  /* ---------- Model dropdown ---------- */
+  function renderModelDropdown() {
+    modelSelect.innerHTML = "";
+    // Default option
+    const defaultOpt = document.createElement("option");
+    defaultOpt.value = "";
+    defaultOpt.textContent = "Default model (server default)";
+    modelSelect.appendChild(defaultOpt);
+    for (const m of availableModels) {
+      const opt = document.createElement("option");
+      opt.value = JSON.stringify({ providerID: m.providerID, modelID: m.modelID });
+      opt.textContent = `${m.label} (${m.providerID})`;
+      modelSelect.appendChild(opt);
+    }
+    modelSelect.disabled = availableModels.length === 0;
+  }
+
+  modelSelect.addEventListener("change", () => {
+    const val = modelSelect.value;
+    if (!val) {
+      window.parent.postMessage({ type: "selectModel", model: null }, "*");
+      return;
+    }
+    try {
+      const model = JSON.parse(val);
+      window.parent.postMessage({ type: "selectModel", model }, "*");
+    } catch (e) {
+      console.error("OpenCode Bridge: invalid model value", val);
+    }
+  });
 
   /* ---------- Messages ---------- */
   function appendUserMessage(id, text) {
@@ -121,13 +146,11 @@
 
   function updateAssistantMessage(messageID, delta, fullText) {
     if (!streamingMessageEl || streamingMessageEl.id !== messageID) {
-      // Start a fresh bubble if we somehow lost track.
       startAssistantMessage(messageID, null);
     }
     const bubble = streamingMessageEl.querySelector(".bubble");
     streamingText = fullText;
     bubble.innerHTML = renderMarkdown(streamingText);
-    // Remove 'streaming' class once content present; keep pulse while loading.
     streamingMessageEl.classList.remove("streaming");
     attachCopyHandlers();
     scrollToBottom();
@@ -203,7 +226,6 @@
       ev.preventDefault();
       send();
     }
-    // Shift+Enter: default newline (textarea handles it).
   });
 
   btnSend.addEventListener("click", (ev) => {
@@ -239,6 +261,23 @@
     switch (msg.type) {
       case "init":
         currentSessionID = msg.sessionID ?? null;
+        availableModels = msg.models || [];
+        renderModelDropdown();
+        if (msg.selectedModel) {
+          // Select matching option
+          for (let i = 0; i < modelSelect.options.length; i++) {
+            const opt = modelSelect.options[i];
+            if (opt.value && opt.value !== "") {
+              try {
+                const m = JSON.parse(opt.value);
+                if (m.providerID === msg.selectedModel.providerID && m.modelID === msg.selectedModel.modelID) {
+                  modelSelect.selectedIndex = i;
+                  break;
+                }
+              } catch { /* ignore */ }
+            }
+          }
+        }
         break;
       case "status":
         setStatus(msg.status, msg.message);
@@ -250,7 +289,7 @@
         break;
       case "assistant-start":
         startAssistantMessage(msg.messageID, msg.sessionID);
-        setStatus("loading");
+        setStatus("thinking", msg.message || "OpenCode is thinking…");
         break;
       case "assistant-delta":
         updateAssistantMessage(msg.messageID, msg.delta, msg.text);
@@ -261,9 +300,42 @@
       case "error":
         setStatus("error", msg.message);
         showRetry(true);
+        // Also append an error message bubble to the chat
+        const errDiv = document.createElement("div");
+        errDiv.className = "message system-error";
+        errDiv.innerHTML = `<div class="bubble error-bubble">⚠ ${escapeHtml(msg.message)}</div>`;
+        if (msg.details) {
+          errDiv.innerHTML += `<details><summary>Details</summary><pre>${escapeHtml(msg.details)}</pre></details>`;
+        }
+        messagesEl.appendChild(errDiv);
+        scrollToBottom();
         break;
       case "retry":
         showRetry(false);
+        break;
+      case "providers":
+        availableModels = (msg.providers || []).map(p => ({
+          id: p.modelID || p.id,
+          label: p.name || p.id,
+          providerID: p.providerID || p.id,
+          modelID: p.modelID || p.id,
+        }));
+        renderModelDropdown();
+        break;
+      case "no-providers":
+        modelSelect.innerHTML = "";
+        const noOpt = document.createElement("option");
+        noOpt.value = "";
+        noOpt.textContent = "No providers configured";
+        noOpt.disabled = true;
+        modelSelect.appendChild(noOpt);
+        modelSelect.disabled = true;
+        // Show an info bubble
+        const infoDiv = document.createElement("div");
+        infoDiv.className = "message system-error";
+        infoDiv.innerHTML = `<div class="bubble error-bubble">⚠ No model providers are connected to OpenCode. Open OpenCode and run <code>/connect</code> to add a provider (e.g. Anthropic, OpenAI), then refresh this view.</div>`;
+        messagesEl.appendChild(infoDiv);
+        scrollToBottom();
         break;
       default:
         console.warn("[opencode-bridge webview] unknown message", msg.type);

@@ -15,40 +15,52 @@
 
 import * as path from "path";
 import * as vscode from "vscode";
-import { OpencodeBridgeClient, BridgeEvent } from "./client.js";
+import {
+  OpencodeBridgeClient,
+  BridgeEvent,
+  BridgeProvider,
+} from "./client.js";
+import { outputChannel, logError } from "./server.js";
 
 export interface ChatViewOptions {
   client: OpencodeBridgeClient;
   extensionPath: string;
   sessionID?: string; // resume this session while VS Code is open
+  debug?: boolean;
 }
 
 type WebviewMessage =
-  | { type: "init"; sessionID?: string; messages: any[] }
-  | { type: "status"; status: "idle" | "loading" | "error"; message?: string }
-  | { type: "assistant-start"; messageID: string; sessionID: string }
+  | { type: "init"; sessionID?: string; models: any[]; selectedModel?: { providerID: string; modelID: string } | null }
+  | { type: "status"; status: "idle" | "loading" | "error" | "thinking"; message?: string }
+  | { type: "assistant-start"; messageID: string; sessionID?: string }
   | { type: "assistant-delta"; messageID: string; delta: string; text: string }
   | { type: "assistant-end"; messageID: string }
   | { type: "user-message"; id: string; text: string }
-  | { type: "error"; message: string }
-  | { type: "retry" };
+  | { type: "error"; message: string; details?: string }
+  | { type: "retry" }
+  | { type: "providers"; providers: BridgeProvider[] }
+  | { type: "no-providers" };
 
 export class OpenCodeChatView implements vscode.WebviewViewProvider {
   public static readonly viewType = "opencode-bridge.chat";
 
   private readonly client: OpencodeBridgeClient;
   private readonly extensionPath: string;
+  private readonly debug: boolean;
   private _view?: vscode.WebviewView;
   private currentSessionID: string | undefined;
-  private eventStreamAbort?: () => void;
+  private selectedModel: { providerID: string; modelID: string } | null = null;
   private streamingMessageID: string | undefined;
   private streamingText = "";
+  private thinkingTimer: NodeJS.Timeout | undefined;
   private disposables: vscode.Disposable[] = [];
 
   constructor(private readonly opts: ChatViewOptions) {
     this.client = opts.client;
     this.extensionPath = opts.extensionPath;
+    this.debug = opts.debug ?? false;
     if (opts.sessionID) this.currentSessionID = opts.sessionID;
+    this.client.setDebug(this.debug);
   }
 
   register(context: vscode.ExtensionContext): void {
@@ -86,8 +98,8 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
     });
     this.disposables.push(onDidChange);
 
-    // Initial payload: tell the webview the current session + any history.
-    this.postInit();
+    // Initial payload: tell the webview the current session + available models.
+    await this.postInit();
 
     // Start listening to server events.
     this.ensureEventStream();
@@ -95,25 +107,46 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
 
   dispose(): void {
     this.stopEventStream();
+    if (this.thinkingTimer) {
+      clearTimeout(this.thinkingTimer);
+      this.thinkingTimer = undefined;
+    }
     for (const d of this.disposables) d.dispose();
     this.disposables = [];
+  }
+
+  /** Set the selected model (called by extension.ts when globalState/setting changes). */
+  setSelectedModel(model: { providerID: string; modelID: string } | null): void {
+    this.selectedModel = model;
+    this.postToWebview({
+      type: "init",
+      sessionID: this.currentSessionID,
+      models: [],
+      selectedModel: model ?? null,
+    });
   }
 
   /** Called by extension.ts when "New chat" is requested. */
   async newChat(directory?: string): Promise<void> {
     try {
+      this.debugLog("Creating new chat session");
       const session = await this.client.createSession({
         title: "New chat",
         directory,
+        model: this.selectedModel ?? undefined,
       });
       this.currentSessionID = session.id;
       this.streamingMessageID = undefined;
       this.streamingText = "";
       this.postStatus("idle");
-      this.postInit();
+      await this.postInit();
+      this.debugLog(`New chat ready: session=${session.id}`);
     } catch (err) {
-      this.postStatus("error", errorMessage(err));
-      void vscode.window.showErrorMessage(`OpenCode Bridge: ${errorMessage(err)}`);    }
+      const msg = errorMessage(err);
+      this.postStatus("error", msg);
+      this.postToWebview({ type: "error", message: msg, details: String(err) });
+      vscode.window.showErrorMessage(`OpenCode Bridge: ${msg}`);
+    }
   }
 
   /** Send a user message (from the webview or from "Ask about selection"). */
@@ -125,28 +158,38 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
 
     const fullText = context ? `${context}\n\n---\n\n${text}` : text;
 
-    this.postStatus("loading");
-    this.streamingMessageID = undefined;
-    this.streamingText = "";
+    this.debugLog(`sendMessage: session=${this.currentSessionID} textLen=${fullText.length}`);
 
-    // Echo the user message immediately so the UI stays responsive.
+    // Optimistic: echo the user message immediately.
     const userID = `user_${Date.now()}`;
     this.postToWebview({ type: "user-message", id: userID, text: fullText });
+
+    // Thinking indicator.
+    this.streamingMessageID = undefined;
+    this.streamingText = "";
+    this.postStatus("thinking", "OpenCode is thinking…");
+    this.startThinkingTimer();
 
     try {
       await this.client.prompt({
         sessionID: this.currentSessionID,
         text: fullText,
+        model: this.selectedModel ?? undefined,
       });
       // The assistant reply streams in via the SSE event stream.
+      this.debugLog("Prompt sent, waiting for SSE stream…");
     } catch (err) {
-      this.postStatus("error", errorMessage(err));
-      this.postToWebview({ type: "error", message: errorMessage(err) });
+      this.stopThinkingTimer();
+      const msg = errorMessage(err);
+      this.postStatus("error", msg);
+      this.postToWebview({ type: "error", message: msg, details: String(err) });
+      vscode.window.showErrorMessage(`OpenCode Bridge: ${msg}`);
     }
   }
 
   /** Retry the last message (re-send). Handled by the webview resending; here we just clear error state. */
   retry(): void {
+    this.stopThinkingTimer();
     this.postStatus("idle");
     this.postToWebview({ type: "retry" });
   }
@@ -170,6 +213,20 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       case "retry":
         this.retry();
         break;
+      case "selectModel":
+        this.selectedModel = msg.model
+          ? { providerID: msg.model.providerID, modelID: msg.model.modelID }
+          : null;
+        this.debugLog(`Model selected: ${this.selectedModel ? this.selectedModel.providerID + "/" + this.selectedModel.modelID : "default"}`);
+        // Persist via extension through globalState is handled by extension.ts;
+        // here we just update the UI.
+        this.postToWebview({
+          type: "init",
+          sessionID: this.currentSessionID,
+          models: [],
+          selectedModel: this.selectedModel ?? null,
+        });
+        break;
       default:
         console.warn("[opencode-bridge] unknown webview message:", msg.type);
     }
@@ -184,16 +241,62 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
     }
   }
 
-  private postInit(): void {
+  private async postInit(): Promise<void> {
+    let models: any[] = [];
+    try {
+      const providerModels = await this.client.getModels();
+      models = providerModels.map((m) => ({
+        id: m.modelID,
+        label: m.name,
+        providerID: m.providerID,
+        modelID: m.modelID,
+      }));
+    } catch (err) {
+      this.debugLog(`Failed to load models for init: ${errorMessage(err)}`);
+      // If no providers, tell the webview.
+      const providers = await this.client.getProviders().catch(() => [] as BridgeProvider[]);
+      if (providers.length === 0) {
+        this.postToWebview({ type: "no-providers" });
+      }
+    }
     this.postToWebview({
       type: "init",
       sessionID: this.currentSessionID,
-      messages: [], // history is fetched lazily if needed; keep simple
+      models,
+      selectedModel: this.selectedModel ?? null,
     });
   }
 
-  private postStatus(status: "idle" | "loading" | "error", message?: string): void {
+  private postStatus(status: "idle" | "loading" | "error" | "thinking", message?: string): void {
     this.postToWebview({ type: "status", status, message });
+  }
+
+  private debugLog(message: string): void {
+    if (this.debug) {
+      console.log(`[opencode-bridge chat] ${message}`);
+      outputChannel().appendLine(`[opencode-bridge chat] ${new Date().toISOString()} ${message}`);
+    }
+  }
+
+  private startThinkingTimer(): void {
+    this.stopThinkingTimer();
+    this.thinkingTimer = setTimeout(() => {
+      this.postStatus("error", "No response from OpenCode within 30s. Check the Output channel for details.");
+      this.postToWebview({
+        type: "error",
+        message: "Timeout: no assistant response received within 30 seconds.",
+        details: "The server may be overloaded or the model backend may be unreachable.",
+      });
+      this.streamingMessageID = undefined;
+      this.streamingText = "";
+    }, 30_000);
+  }
+
+  private stopThinkingTimer(): void {
+    if (this.thinkingTimer) {
+      clearTimeout(this.thinkingTimer);
+      this.thinkingTimer = undefined;
+    }
   }
 
   /* ------------------------------------------------------------------ */
@@ -201,72 +304,82 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
   /* ------------------------------------------------------------------ */
 
   private ensureEventStream(): void {
-    // Only one event stream at a time.
     this.stopEventStream();
 
     const abort = this.client.subscribeToEvents({
       onEvent: (event: BridgeEvent) => this.handleServerEvent(event),
       onError: (err: unknown) => {
-        console.warn("[opencode-bridge] SSE error:", err);
-        // Don't hard-fail the UI on SSE hiccups; the server may be restarting.
+        this.debugLog(`SSE error: ${errorMessage(err)}`);
+        logError(`SSE stream error: ${errorMessage(err)}`);
+        // Don't hard-fail the UI; the server may be restarting.
       },
     });
-    this.eventStreamAbort = abort.abort;
+
+    const disposable = new vscode.Disposable(() => abort.abort());
+    this.disposables.push(disposable);
   }
 
   private stopEventStream(): void {
-    if (this.eventStreamAbort) {
-      try {
-        this.eventStreamAbort();
-      } catch {
-        /* ignore */
-      }
-      this.eventStreamAbort = undefined;
-    }
+    // The SSE abort disposable is pushed directly to this.disposables and
+    // disposed there; the client's cancelled flag stops further dispatching.
   }
 
   private handleServerEvent(event: BridgeEvent): void {
-    if (!this.currentSessionID && event.sessionID && event.sessionID !== this.currentSessionID) {
-      return; // events for other sessions
+    this.debugLog(`SSE event received: ${event.type}`);
+
+    // Ignore events for other sessions when we have an active session.
+    if (
+      this.currentSessionID &&
+      event.sessionID &&
+      event.sessionID !== this.currentSessionID
+    ) {
+      return;
     }
 
     // Assistant streaming text.
     const part = OpencodeBridgeClient.extractTextDelta(event);
     if (part) {
-      const messageID = part.messageID;
+      this.stopThinkingTimer();
       if (!this.streamingMessageID) {
-        this.streamingMessageID = messageID;
-        this.streamingText = part.text ?? "";
+        this.streamingMessageID = part.messageID;
+        this.streamingText = part.text;
         this.postToWebview({
           type: "assistant-start",
-          messageID,
+          messageID: this.streamingMessageID,
           sessionID: part.sessionID,
         });
+      } else {
+        this.streamingText += part.text;
       }
-      if (part.delta) {
-        this.streamingText += part.delta;
-      } else if (typeof part.text === "string") {
-        this.streamingText = part.text;
-      }
-      this.postStatus("loading");
+      this.postStatus("thinking");
       this.postToWebview({
         type: "assistant-delta",
-        messageID: this.streamingMessageID || messageID,
-        delta: part.delta ?? "",
+        messageID: this.streamingMessageID,
+        delta: part.text,
         text: this.streamingText,
       });
       return;
     }
 
-    // A message was finalized.
-    if (event.type === "message.updated" && this.streamingMessageID) {
+    // Text started - just ensure we have a bubble.
+    if (event.type === "session.text.started" && !this.streamingMessageID) {
       const data = event.data as Record<string, unknown> | null;
-      const info = data && typeof data.info === "object" ? data.info : null;
-      const finished =
-        info &&
-        typeof (info as Record<string, unknown>).finish === "string" &&
-        (info as Record<string, unknown>).finish !== "";
-      if (finished) {
+      const msgID = data && typeof data.assistantMessageID === "string" ? data.assistantMessageID : undefined;
+      if (msgID) {
+        this.streamingMessageID = msgID;
+        this.streamingText = "";
+        this.postToWebview({
+          type: "assistant-start",
+          messageID: msgID,
+          sessionID: event.sessionID,
+        });
+      }
+      return;
+    }
+
+    // Text ended.
+    if (event.type === "session.text.ended") {
+      if (this.streamingMessageID) {
         this.postToWebview({ type: "assistant-end", messageID: this.streamingMessageID });
         this.streamingMessageID = undefined;
         this.streamingText = "";
@@ -275,19 +388,40 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       return;
     }
 
+    // Execution succeeded (fallback if no text.ended).
+    if (event.type === "session.execution.succeeded") {
+      if (this.streamingMessageID) {
+        this.postToWebview({ type: "assistant-end", messageID: this.streamingMessageID });
+        this.streamingMessageID = undefined;
+        this.streamingText = "";
+        this.postStatus("idle");
+      }
+      return;
+    }
+
+    // Execution failed.
+    if (event.type === "session.execution.failed") {
+      this.stopThinkingTimer();
+      const data = event.data as Record<string, unknown> | null;
+      const msg = data && typeof data.error === "object" && data.error
+        ? String((data.error as Record<string, unknown>).message ?? "execution failed")
+        : "OpenCode execution failed";
+      this.postStatus("error", msg);
+      this.postToWebview({ type: "error", message: msg, details: String(event.data) });
+      this.streamingMessageID = undefined;
+      this.streamingText = "";
+      return;
+    }
+
     // Session created -> remember id.
     if (event.type === "session.created") {
       const data = event.data as Record<string, unknown> | null;
-      const props =
-        data && typeof data.properties === "object" && data.properties
-          ? (data.properties as Record<string, unknown>)
-          : null;
-      const info = props && typeof props.info === "object" ? props.info : null;
-      const id = info && typeof (info as Record<string, unknown>).id === "string"
-        ? String((info as Record<string, unknown>).id)
-        : undefined;
-      if (id) {
-        this.currentSessionID = id;
+      const durable = data && typeof data.durable === "object" && data.durable
+        ? (data.durable as Record<string, unknown>)
+        : null;
+      const aggID = durable && typeof durable.aggregateID === "string" ? durable.aggregateID : undefined;
+      if (aggID && aggID.startsWith("ses_")) {
+        this.currentSessionID = aggID;
         this.postInit();
       }
     }
@@ -329,6 +463,7 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       <div class="title">OpenCode Bridge</div>
       <div class="subtitle">Local <code>opencode serve</code> chat</div>
       <div class="actions">
+        <select id="modelSelect" title="Model" aria-label="Model"></select>
         <button id="btnNewChat" title="New chat">&#128214;</button>
         <button id="btnRetry" title="Retry" style="display:none">&#x21BB;</button>
       </div>

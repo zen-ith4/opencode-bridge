@@ -10,7 +10,7 @@ to drive it.
 ## Features
 
 1. **Server lifecycle**
-   - Checks whether a server is already running at the configured host/port (`GET /doc`).
+   - Checks whether a server is already running at the configured host/port (`GET /api/info`).
    - If not, spawns `opencode serve --port <port>` (cwd = first workspace folder), waits up to ~10s, and shows a clear error if the `opencode` binary is not found.
    - Kills only the process it spawned itself on `deactivate`.
    - Optional basic auth via `OPENCODE_SERVER_PASSWORD` env var or the `opencodeBridge.serverPassword` secret.
@@ -19,13 +19,14 @@ to drive it.
    - Message list, input box, send button, Enter to send, Shift+Enter for newline.
    - Assistant replies rendered as Markdown with code blocks and a "Copy" button per code block.
    - Live streaming via the server's `/api/event` SSE stream; `session.prompt` does not block the UI.
+   - Model dropdown in the chat header, populated from the server's providers/models endpoints; choice is persisted.
    - "New chat" creates a fresh session (remembered while VS Code is open).
-   - Loading and error states with retry.
+   - Loading and error states with retry. Every error is shown in the chat and written to the "OpenCode Bridge" Output channel.
 
 3. **Editor integration**
    - `OpenCode: Ask about selection` — sends selected code + file path + line range as context (also in the editor context menu).
    - `OpenCode: Add current file` — sends the whole current file as context.
-   - Keybinding `Ctrl+Shift+O` (`Cmd+Shift+O` on Mac) to open the chat.
+   - Keybinding `Ctrl+Alt+O` (`Cmd+Alt+O` on Mac) to open the chat.
 
 4. **Settings** (`contributes.configuration`)
    - `opencodeBridge.port` (default `4096`)
@@ -33,6 +34,7 @@ to drive it.
    - `opencodeBridge.autoStartServer` (default `true`)
    - `opencodeBridge.opencodePath` (default `"opencode"`)
    - `opencodeBridge.model` (optional `providerID/modelID`, e.g. `anthropic/claude-3-5-sonnet-20241022`)
+   - `opencodeBridge.debug` (default `false`) — enable debug logging to the "OpenCode Bridge" Output channel and console.
 
 ## Requirements
 
@@ -50,7 +52,7 @@ to drive it.
    ```sh
    opencode serve --port 4096
    ```
-   (or set `OPENCODE_PASSWORD` for a fixed basic-auth password).
+   (or set `OPENCODE_SERVER_PASSWORD` for a fixed basic-auth password).
 4. Open the sidebar ("OpenCode Bridge") and start chatting.
 
 ### From source (F5)
@@ -79,7 +81,8 @@ Open **Settings** → **Extensions** → **OpenCode Bridge**, or edit `settings.
   "opencodeBridge.hostname": "127.0.0.1",
   "opencodeBridge.autoStartServer": true,
   "opencodeBridge.opencodePath": "opencode",
-  "opencodeBridge.model": ""
+  "opencodeBridge.model": "",
+  "opencodeBridge.debug": false
 }
 ```
 
@@ -90,7 +93,7 @@ If your `opencode serve` was started with a password, set it via the secret stor
 
 ```sh
 # Option A: extension secret (per-machine, not written to settings.json)
-# set via: opencode-bridge secret — see "Secret" below
+# Use the "OpenCode: Set Server Password" command to store it securely.
 
 # Option B: environment variable (launch VS Code / VSCodium with this)
 export OPENCODE_SERVER_PASSWORD=your-password
@@ -99,12 +102,9 @@ export OPENCODE_SERVER_PASSWORD=your-password
 The extension sends `Authorization: Basic opencode:<password>`. The username is
 literally `opencode` (as required by the OpenCode server).
 
-> There is no settings UI for the password yet; use `OPENCODE_SERVER_PASSWORD` or
-> set the secret programmatically:
-> ```ts
-> await context.secrets.get("opencodeBridge.serverPassword")
-> ```
-> (The secret key is `opencodeBridge.serverPassword`.)
+The secret key is `opencodeBridge.serverPassword`. Use the
+**OpenCode: Set Server Password** command to store it in VS Code's secret
+storage without editing `settings.json`.
 
 ## Usage
 
@@ -118,21 +118,10 @@ literally `opencode` (as required by the OpenCode server).
 
 | Command | Keybinding | Menu |
 |---|---|---|
-| `OpenCode: Open Chat` | `Ctrl+Shift+O` | activity bar |
+| `OpenCode: Open Chat` | `Ctrl+Alt+O` | activity bar |
 | `OpenCode: Ask about selection` | — | editor context menu |
 | `OpenCode: Add current file as context` | — | editor title |
-
-## Publishing to Open VSX
-
-This extension is published to [Open VSX](https://open-vsx.org) (compatible with VSCodium) using [`ovsx`](https://github.com/ochauti/ovsx):
-
-```sh
-npm install -g ovsx
-ovsx package               # produces opencode-bridge-0.1.0.vsix
-ovsx publish opencode-bridge-0.1.0.vsix --pat <YOUR_OPEN_VSX_PAT>
-```
-
-You need an Open VSX personal access token. The `engines.vscode` field is set to `^1.85.0` for broad compatibility with both VS Code and VSCodium.
+| `OpenCode: Set Server Password` | — | command palette |
 
 ## Troubleshooting
 

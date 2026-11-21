@@ -17,6 +17,9 @@
   --oc-accent-hover: var(--vscode-button-hoverBackground, #1177d1);
   --oc-code-bg: var(--vscode-textBlockQuote-background, #252526);
   --oc-code-border: var(--vscode-editorWidget-border, #3c3c3c);
+  --oc-select-bg: var(--vscode-dropdown-background, #3c3c3c);
+  --oc-select-border: var(--vscode-dropdown-border, #3c3c3c);
+  --oc-error: var(--vscode-errorForeground, #f48771);
 }
 
 * { box-sizing: border-box; }
@@ -64,6 +67,22 @@ html, body {
 .actions {
   display: flex;
   gap: 6px;
+  align-items: center;
+}
+
+select {
+  background: var(--oc-select-bg);
+  color: var(--oc-text);
+  border: 1px solid var(--oc-select-border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  min-width: 180px;
+}
+
+select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 button {
@@ -100,6 +119,7 @@ button.secondary:hover { background: var(--oc-border); }
 
 .message.user { align-self: flex-end; }
 .message.assistant { align-self: flex-start; }
+.message.system-error { align-self: flex-start; }
 
 .bubble {
   padding: 8px 12px;
@@ -121,6 +141,18 @@ button.secondary:hover { background: var(--oc-border); }
   color: var(--oc-text);
   border: 1px solid var(--oc-border);
   border-bottom-left-radius: 2px;
+}
+
+.message.system-error .bubble {
+  background: rgba(244, 135, 113, 0.15);
+  color: var(--oc-error);
+  border: 1px solid var(--oc-error);
+  border-bottom-left-radius: 2px;
+}
+
+.error-bubble {
+  display: block;
+  margin-bottom: 6px;
 }
 
 .meta {
@@ -157,7 +189,8 @@ button.secondary:hover { background: var(--oc-border); }
 
 @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
 
-.status.error { color: var(--vscode-errorForeground, #f48771); }
+.status.error { color: var(--oc-error); }
+.status.thinking { color: var(--oc-accent); }
 
 .composer {
   display: flex;

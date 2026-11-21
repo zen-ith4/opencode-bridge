@@ -34,19 +34,23 @@
       {
         "command": "opencode-bridge.addFileContext",
         "title": "OpenCode: Add current file as context"
+      },
+      {
+        "command": "opencode-bridge.setServerPassword",
+        "title": "OpenCode: Set Server Password"
       }
     ],
     "keybindings": [
       {
         "command": "opencode-bridge.openChat",
-        "key": "ctrl+shift+o",
-        "mac": "cmd+shift+o",
+        "key": "ctrl+alt+o",
+        "mac": "cmd+alt+o",
         "when": "editorTextFocus"
       },
       {
         "command": "opencode-bridge.openChat",
-        "key": "ctrl+shift+o",
-        "mac": "cmd+shift+o",
+        "key": "ctrl+alt+o",
+        "mac": "cmd+alt+o",
         "when": "explorerTextFocus"
       }
     ],
@@ -113,6 +117,11 @@
           "type": "string",
           "default": "",
           "description": "Optional model as providerID/modelID (e.g. anthropic/claude-3-5-sonnet-20241022). If empty, OpenCode's own default model is used."
+        },
+        "opencodeBridge.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug logging to the 'OpenCode Bridge' Output channel and console."
         }
       }
     }

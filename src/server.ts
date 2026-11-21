@@ -3,13 +3,15 @@
  *
  * Responsibilities:
  *  - Check whether an OpenCode HTTP server (`opencode serve`) is already
- *    reachable at the configured host/port (GET /doc or /api/info).
+ *    reachable at the configured host/port (GET /api/info).
  *  - If not (and autoStartServer is enabled), spawn `opencode serve --port <port>`
  *    with cwd set to the first workspace folder, wait for it to respond (~10s).
  *  - Report a clear error when the `opencode` binary is not found in PATH.
  *  - Keep track of the child process the extension spawned so it can be killed
  *    on deactivate (only OUR process is ever killed).
- *  - Resolve optional basic auth (OPENCODE_SERVER_PASSWORD env var / secret).
+ *  - Resolve optional basic auth from the OPENCODE_SERVER_PASSWORD env var or
+ *    the context.secrets entry `opencodeBridge.serverPassword`.
+ *  - Write diagnostics to the "OpenCode Bridge" Output channel.
  */
 
 import * as cp from "child_process";
@@ -24,9 +26,7 @@ export interface ServerInfo {
   spawnedProcess?: cp.ChildProcess;
 }
 
-/**
- * Result of trying to reach a running server.
- */
+/** Result of trying to reach a running server. */
 export interface Reachability {
   reachable: boolean;
   statusCode?: number;
@@ -37,12 +37,38 @@ export interface Reachability {
 const SERVER_READY_TIMEOUT_MS = 10_000;
 /** Poll interval while waiting for the server. */
 const POLL_INTERVAL_MS = 250;
+/** Path used to probe whether a server is up. `/api/info` returns server info. */
+const PROBE_PATH = "/api/info";
 
-/** Path used to probe whether a server is up. `/doc` serves the web app. */
-const PROBE_PATH = "/doc";
+/** The Output channel name used for all OpenCode Bridge diagnostics. */
+export const OUTPUT_CHANNEL_NAME = "OpenCode Bridge";
+
+let _outputChannel: vscode.OutputChannel | undefined;
+
+/** Get (lazily creating) the Output channel. */
+export function outputChannel(): vscode.OutputChannel {
+  if (!_outputChannel) {
+    _outputChannel = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
+  }
+  return _outputChannel;
+}
+
+/** Write a debug line to the Output channel (and console if debug is on). */
+export function logDebug(message: string, debug = false): void {
+  const line = `[opencode-bridge] ${new Date().toISOString()} ${message}`;
+  outputChannel().appendLine(line);
+  if (debug) console.log(line);
+}
+
+/** Write an error line to the Output channel (and console). */
+export function logError(message: string): void {
+  const line = `[opencode-bridge] ${new Date().toISOString()} ERROR: ${message}`;
+  outputChannel().appendLine(line);
+  console.error(line);
+}
 
 /**
- * Build the base URL (including the /api prefix the SDK/server routes use)
+ * Build the base URL (including the /api prefix the server routes use)
  * from host and port.
  */
 export function buildBaseUrl(hostname: string, port: number): string {
@@ -59,6 +85,7 @@ function envAuthHeader(): string | undefined {
 /**
  * Fetch a path against the server and report reachability. Uses a short
  * timeout so the probe fails fast when nothing is listening.
+ * Any HTTP response (including 401) means a server is reachable.
  */
 async function probe(hostname: string, port: number): Promise<Reachability> {
   const url = `http://${hostname}:${port}${PROBE_PATH}`;
@@ -73,14 +100,12 @@ async function probe(hostname: string, port: number): Promise<Reachability> {
   }, 4000);
 
   try {
-    const res = await fetch(url, {
-      method: "GET",
-      headers: { ...(envAuthHeader() ? { Authorization: envAuthHeader() } : {}) },
-      signal: controller.signal,
-    });
+    const headers: Record<string, string> = {};
+    const ah = envAuthHeader();
+    if (ah) headers.Authorization = ah;
+    const res = await fetch(url, { method: "GET", headers, signal: controller.signal });
     settled = true;
     clearTimeout(timeoutId);
-    // Any HTTP response (including 401) means a server is reachable.
     return { reachable: true, statusCode: res.status };
   } catch (err) {
     settled = true;
@@ -95,16 +120,13 @@ async function probe(hostname: string, port: number): Promise<Reachability> {
 /**
  * Check whether a server is already running at host/port.
  */
-export async function isServerReachable(
-  hostname: string,
-  port: number
-): Promise<Reachability> {
+export async function isServerReachable(hostname: string, port: number): Promise<Reachability> {
   return probe(hostname, port);
 }
 
 /**
- * Wait until the server responds, up to SERVER_READY_TIMEOUT_MS. Resolves
- * true as soon as it is reachable; false on timeout.
+ * Wait until the server responds, up to timeoutMs. Resolves true as soon
+ * as it is reachable; false on timeout.
  */
 export async function waitForServer(
   hostname: string,
@@ -164,8 +186,6 @@ export function spawnOpencodeServe(
   const args = ["serve", "--hostname", hostname, "--port", String(port)];
   const options: cp.SpawnOptions = {};
   if (cwd) options.cwd = cwd;
-  // Inherit stdio so server logs surface in the terminal output; also lets the
-  // process survive and be killed by PID.
   options.stdio = ["ignore", "pipe", "pipe"];
 
   let child: cp.ChildProcess;
@@ -178,14 +198,19 @@ export function spawnOpencodeServe(
     );
   }
 
-  // Surface server stdout/stderr to the Output channel for debugging.
   child.stdout?.on("data", (chunk) => {
     const text = chunk.toString().trim();
-    if (text) console.log(`[opencode serve] ${text}`);
+    if (text) {
+      outputChannel().appendLine(`[opencode serve] ${text}`);
+      console.log(`[opencode serve] ${text}`);
+    }
   });
   child.stderr?.on("data", (chunk) => {
     const text = chunk.toString().trim();
-    if (text) console.error(`[opencode serve] ${text}`);
+    if (text) {
+      outputChannel().appendLine(`[opencode serve stderr] ${text}`);
+      console.error(`[opencode serve stderr] ${text}`);
+    }
   });
 
   return child;
