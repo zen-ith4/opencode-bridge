@@ -149,23 +149,3 @@ You need an Open VSX personal access token. The `engines.vscode` field is set to
 
 It does **not** implement any LLM provider, API key handling, or model routing. All model inference happens inside the `opencode serve` process you run locally.
 
----
-
-## راهنمای کوتاه فارسی (Persian)
-
-این افزونه یک کلاینت چت برای OpenCode (opencode.ai) در VS Code / VSCodium است.
-این افزونه هیچ API مدل هوşی فراخوانی نمی‌کند و فقط به سرور لوکال `opencode serve` وصل می‌شود.
-
-### تنظیمات مهم
-- `opencodeBridge.port`: پیش‌فرض `4096`
-- `opencodeBridge.hostname`: پیش‌فرض `127.0.0.1`
-- `opencodeBridge.autoStartServer`: اگر `true` باشد، افزونه خود سرور را اجرا می‌کند
-- `opencodeBridge.opencodePath`: مسیر فایل اجرا `opencode`
-
-### نحوه اجرا
-1. `npm install` و سپس `npm run compile`
-2. سرور OpenCode را اجرا کنید: `opencode serve --port 4096`
-3. دکمه F5 برای باز کردن افزونه در محیط توسعه، سپس نوار کناری "OpenCode Bridge" را باز کنید و چت کنید.
-
-### نکته
-پاسخ‌های مدل از سمت سرور OpenCode هستند. اگر سرور مدل پیکربندی نشده یا در دسترس نباشد، متنپاسخی دریافت نمی‌کنید (این مشکل از مدل است نه افزونه).
