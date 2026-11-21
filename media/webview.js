@@ -17,9 +17,10 @@
   const statusEl = document.getElementById("status");
   const modelSelect = document.getElementById("modelSelect");
   const serverInfo = document.getElementById("serverInfo");
+  const btnKey = document.getElementById("btnKey");
   const composer = document.getElementById("composer");
 
-  if (!messagesEl || !inputEl || !btnSend || !composer || !modelSelect) {
+  if (!messagesEl || !inputEl || !btnSend || !composer || !modelSelect || !serverInfo) {
     console.error("OpenCode Bridge: required DOM elements missing");
     return;
   }
@@ -28,6 +29,8 @@
   let streamingMessageEl = null;
   let streamingText = "";
   let availableModels = []; // { id, label, providerID, modelID }
+  let currentMode = "managed";
+  let awaitingPassword = false;
 
   /* ---------- Escape HTML ---------- */
   function escapeHtml(text) {
@@ -263,11 +266,15 @@
       case "init":
         currentSessionID = msg.sessionID ?? null;
         availableModels = msg.models || [];
+        currentMode = msg.mode || "managed";
+        awaitingPassword = !!msg.providersError && (msg.providersError.includes("401") || msg.providersError.includes("403"));
         renderModelDropdown();
-        // Show server URL and working directory in the header tooltip.
+        updateKeyButtonVisibility();
+        // Show server URL, mode, and working directory in the header tooltip.
         if (serverInfo) {
           const parts = [];
           if (msg.serverUrl) parts.push(`Server: ${msg.serverUrl}`);
+          if (msg.mode) parts.push(`Mode: ${msg.mode}`);
           if (msg.workspaceDir) parts.push(`Workspace: ${msg.workspaceDir}`);
           serverInfo.textContent = parts.join("  |  ");
           serverInfo.title = parts.join("\n");
@@ -277,7 +284,12 @@
         if (msg.providersError) {
           const errDiv = document.createElement("div");
           errDiv.className = "message system-error";
-          errDiv.innerHTML = `<div class="bubble error-bubble">⚠ Failed to load models/providers: ${escapeHtml(msg.providersError)}</div>`;
+          const isAuthError = msg.providersError.includes("401") || msg.providersError.includes("403");
+          if (isAuthError && currentMode === "external") {
+            errDiv.innerHTML = `<div class="bubble error-bubble">⚠ Authentication required: ${escapeHtml(msg.providersError)}</div><button class="btn-enter-password" id="btnEnterPassword">Enter password</button>`;
+          } else {
+            errDiv.innerHTML = `<div class="bubble error-bubble">⚠ ${escapeHtml(msg.providersError)}</div>`;
+          }
           messagesEl.appendChild(errDiv);
           scrollToBottom();
         }
@@ -321,9 +333,13 @@
         // Also append an error message bubble to the chat
         const errDiv = document.createElement("div");
         errDiv.className = "message system-error";
-        errDiv.innerHTML = `<div class="bubble error-bubble">⚠ ${escapeHtml(msg.message)}</div>`;
-        if (msg.details) {
-          errDiv.innerHTML += `<details><summary>Details</summary><pre>${escapeHtml(msg.details)}</pre></details>`;
+        const isAuthError = msg.message.includes("401") || msg.message.includes("403");
+        if (isAuthError && currentMode === "external") {
+          errDiv.innerHTML = `<div class="bubble error-bubble">⚠ ${escapeHtml(msg.message)}</div><button class="btn-enter-password" id="btnEnterPassword">Enter password</button>`;
+        } else if (msg.details) {
+          errDiv.innerHTML = `<div class="bubble error-bubble">⚠ ${escapeHtml(msg.message)}</div><details><summary>Details</summary><pre>${escapeHtml(msg.details)}</pre></details>`;
+        } else {
+          errDiv.innerHTML = `<div class="bubble error-bubble">⚠ ${escapeHtml(msg.message)}</div>`;
         }
         messagesEl.appendChild(errDiv);
         scrollToBottom();
@@ -358,10 +374,36 @@
         messagesEl.appendChild(infoDiv);
         scrollToBottom();
         break;
+      case "refreshProviders":
+        window.parent.postMessage({ type: "refreshProviders" }, "*");
+        break;
+      case "setPassword":
+        window.parent.postMessage({ type: "setPassword" }, "*");
+        break;
       default:
         console.warn("[opencode-bridge webview] unknown message", msg.type);
     }
   });
+
+  // Key/lock button click (external mode only).
+  if (btnKey) {
+    btnKey.addEventListener("click", () => {
+      window.parent.postMessage({ type: "setPassword" }, "*");
+    });
+  }
+
+  // Enter password button click (delegated, since it's dynamically added).
+  messagesEl.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("#btnEnterPassword");
+    if (btn) {
+      window.parent.postMessage({ type: "enterPassword" }, "*");
+    }
+  });
+
+  function updateKeyButtonVisibility() {
+    if (!btnKey) return;
+    btnKey.style.display = currentMode === "external" ? "inline-block" : "none";
+  }
 
   // Tell the extension the view is ready (optional handshake).
   window.parent.postMessage({ type: "ready" }, "*");

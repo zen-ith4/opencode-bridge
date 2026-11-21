@@ -16,7 +16,9 @@
     "onStartupFinished",
     "onCommand:opencode-bridge.openChat",
     "onCommand:opencode-bridge.askSelection",
-    "onCommand:opencode-bridge.addFileContext"
+    "onCommand:opencode-bridge.addFileContext",
+    "onCommand:opencode-bridge.setServerPassword",
+    "onCommand:opencode-bridge.clearServerPassword"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -38,6 +40,10 @@
       {
         "command": "opencode-bridge.setServerPassword",
         "title": "OpenCode: Set Server Password"
+      },
+      {
+        "command": "opencode-bridge.clearServerPassword",
+        "title": "OpenCode: Clear Server Password"
       }
     ],
     "keybindings": [
@@ -122,6 +128,12 @@
           "type": "boolean",
           "default": false,
           "description": "Enable debug logging to the 'OpenCode Bridge' Output channel and console."
+        },
+        "opencodeBridge.serverMode": {
+          "type": "string",
+          "enum": ["managed", "external"],
+          "default": "managed",
+          "description": "Server connection mode. 'managed' (default) starts a private opencode serve instance with a random password. 'external' connects to an existing server at hostname:port."
         }
       }
     }

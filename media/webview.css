@@ -101,6 +101,39 @@ button:active { transform: translateY(1px); }
 button.secondary { background: var(--oc-user-bg); color: var(--oc-text); }
 button.secondary:hover { background: var(--oc-border); }
 
+/* Key/lock button (external mode only) */
+#btnKey {
+  background: var(--oc-user-bg);
+  color: var(--oc-text);
+  font-size: 14px;
+  padding: 4px 8px;
+  min-width: auto;
+}
+
+#btnKey:hover { background: var(--oc-border); }
+
+/* Enter password button (inline in error bubbles) */
+.btn-enter-password {
+  background: var(--oc-accent);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  margin-left: 8px;
+}
+
+.btn-enter-password:hover { background: var(--oc-accent-hover); }
+
+.server-info {
+  font-size: 10px;
+  color: var(--oc-muted);
+  margin-left: 10px;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
 .messages {
   flex: 1 1 auto;
   overflow-y: auto;

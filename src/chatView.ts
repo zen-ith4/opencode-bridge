@@ -29,10 +29,15 @@ export interface ChatViewOptions {
   debug?: boolean;
   serverUrl?: string; // e.g. http://127.0.0.1:4096/api
   workspaceDir?: string; // first workspace folder path
+  mode?: "managed" | "external"; // server connection mode
+  /** Called when the user clicks the key/lock button (external mode). */
+  onSetPassword?: () => Promise<void>;
+  /** Called when the user clicks "Enter password" after a 401 error. */
+  onEnterPassword?: () => Promise<void>;
 }
 
 type WebviewMessage =
-  | { type: "init"; sessionID?: string; models: any[]; selectedModel?: { providerID: string; modelID: string } | null; serverUrl?: string; workspaceDir?: string | undefined; providersError?: string | null }
+  | { type: "init"; sessionID?: string; models: any[]; selectedModel?: { providerID: string; modelID: string } | null; serverUrl?: string; workspaceDir?: string | undefined; mode?: "managed" | "external"; providersError?: string | null }
   | { type: "status"; status: "idle" | "loading" | "error" | "thinking"; message?: string }
   | { type: "assistant-start"; messageID: string; sessionID?: string }
   | { type: "assistant-delta"; messageID: string; delta: string; text: string }
@@ -51,6 +56,9 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
   private readonly debug: boolean;
   private readonly serverUrl: string;
   private readonly workspaceDir: string | undefined;
+  private readonly mode: "managed" | "external";
+  private readonly onSetPassword?: () => Promise<void>;
+  private readonly onEnterPassword?: () => Promise<void>;
   private _view?: vscode.WebviewView;
   private currentSessionID: string | undefined;
   private selectedModel: { providerID: string; modelID: string } | null = null;
@@ -65,6 +73,9 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
     this.debug = opts.debug ?? false;
     this.serverUrl = opts.serverUrl ?? "";
     this.workspaceDir = opts.workspaceDir;
+    this.mode = opts.mode ?? "managed";
+    this.onSetPassword = opts.onSetPassword;
+    this.onEnterPassword = opts.onEnterPassword;
     if (opts.sessionID) this.currentSessionID = opts.sessionID;
     this.client.setDebug(this.debug);
   }
@@ -131,7 +142,42 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       selectedModel: model ?? null,
       serverUrl: this.serverUrl,
       workspaceDir: this.workspaceDir,
+      mode: this.mode,
     });
+  }
+
+  /** Update the auth header on the SDK client (e.g. after user enters a password). */
+  setAuthHeader(authHeader: string | undefined): void {
+    this.client.setAuthHeader(authHeader);
+  }
+
+  /** Re-query providers/models from the server (triggered by refresh button). */
+  async refreshProviders(): Promise<void> {
+    await this.postInit();
+  }
+
+  /** Prompt the user for a server password, store it, and retry. */
+  async promptForPassword(context: vscode.ExtensionContext): Promise<string | undefined> {
+    const password = await vscode.window.showInputBox({
+      prompt: "OpenCode server password",
+      password: true,
+      placeHolder: "e.g. a-long-secret",
+    });
+    if (password === undefined) return undefined; // cancelled
+    if (!password) {
+      void vscode.window.showWarningMessage("OpenCode Bridge: Password cannot be empty.");
+      return undefined;
+    }
+    try {
+      await context.secrets.store("opencodeBridge.serverPassword", password);
+      this.debugLog("Password stored in secrets");
+      return password;
+    } catch (err) {
+      const msg = errorMessage(err);
+      logError(`Failed to store password: ${msg}`);
+      void vscode.window.showErrorMessage(`OpenCode Bridge: failed to store password: ${msg}`);
+      return undefined;
+    }
   }
 
   /** Called by extension.ts when "New chat" is requested. */
@@ -233,10 +279,34 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
           sessionID: this.currentSessionID,
           models: [],
           selectedModel: this.selectedModel ?? null,
+          mode: this.mode,
         });
+        break;
+      case "refreshProviders":
+        this.refreshProviders().catch((err) =>
+          vscode.window.showErrorMessage(String(err))
+        );
+        break;
+      case "setPassword":
+        this.handleSetPasswordRequest();
+        break;
+      case "enterPassword":
+        this.handleEnterPasswordRequest();
         break;
       default:
         console.warn("[opencode-bridge] unknown webview message:", msg.type);
+    }
+  }
+
+  private async handleSetPasswordRequest(): Promise<void> {
+    if (this.onSetPassword) {
+      await this.onSetPassword();
+    }
+  }
+
+  private async handleEnterPasswordRequest(): Promise<void> {
+    if (this.onEnterPassword) {
+      await this.onEnterPassword();
     }
   }
 
@@ -285,6 +355,7 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       selectedModel: this.selectedModel ?? null,
       serverUrl: this.serverUrl,
       workspaceDir: this.workspaceDir,
+      mode: this.mode,
       providersError,
     });
   }
@@ -487,6 +558,7 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       <div class="actions">
         <select id="modelSelect" title="Model" aria-label="Model"></select>
         <span id="serverInfo" class="server-info" title=""></span>
+        <button id="btnKey" title="Set server password" style="display:none">🔑</button>
         <button id="btnNewChat" title="New chat">&#128214;</button>
         <button id="btnRetry" title="Retry" style="display:none">&#x21BB;</button>
       </div>

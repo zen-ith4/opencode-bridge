@@ -9,19 +9,28 @@ to drive it.
 
 ## Features
 
-1. **Server lifecycle**
-   - Checks whether a server is already running at the configured host/port (`GET /api/info`).
-   - If not, spawns `opencode serve --port <port>` (cwd = first workspace folder), waits up to ~10s, and shows a clear error if the `opencode` binary is not found.
-   - Kills only the process it spawned itself on `deactivate`.
-   - Optional basic auth via `OPENCODE_SERVER_PASSWORD` env var or the `opencodeBridge.serverPassword` secret.
+1. **Server lifecycle** (two modes)
+   - **Managed mode** (default `opencodeBridge.serverMode = "managed"`): The
+     extension always starts its **own private** `opencode serve` child on a
+     free auto-chosen port with a random password. The password is generated
+     by the extension and passed ONLY via the `OPENCODE_SERVER_PASSWORD` env
+     var to the child process — never logged, never written to settings.json.
+     The extension kills only its own child process on `deactivate`.
+   - **External mode** (`opencodeBridge.serverMode = "external"`): Connect to
+     an existing server at `opencodeBridge.hostname:opencodeBridge.port`.
+     Password lookup: VS Code secret store → `OPENCODE_SERVER_PASSWORD` env
+     var → prompt the user.
 
 2. **Sidebar chat view** (activity bar)
    - Message list, input box, send button, Enter to send, Shift+Enter for newline.
    - Assistant replies rendered as Markdown with code blocks and a "Copy" button per code block.
-   - Live streaming via the server's `/api/event` SSE stream; `session.prompt` does not block the UI.
-   - Model dropdown in the chat header, populated from the server's providers/models endpoints; choice is persisted.
+   - Live streaming via the server's `/api/event` SSE stream.
+   - Model dropdown in the chat header, populated from the server's `/api/provider` and `/api/model` endpoints; choice is persisted.
+   - Key/lock button (external mode) to set the server password; "Enter password" button shown on 401 errors.
+   - Header tooltip shows mode, server URL, and working directory.
    - "New chat" creates a fresh session (remembered while VS Code is open).
-   - Loading and error states with retry. Every error is shown in the chat and written to the "OpenCode Bridge" Output channel.
+   - Loading and error states with retry. Every error is shown in the chat as
+     a distinct message and written to the "OpenCode Bridge" Output channel.
 
 3. **Editor integration**
    - `OpenCode: Ask about selection` — sends selected code + file path + line range as context (also in the editor context menu).
@@ -29,12 +38,13 @@ to drive it.
    - Keybinding `Ctrl+Alt+O` (`Cmd+Alt+O` on Mac) to open the chat.
 
 4. **Settings** (`contributes.configuration`)
-   - `opencodeBridge.port` (default `4096`)
-   - `opencodeBridge.hostname` (default `127.0.0.1`)
-   - `opencodeBridge.autoStartServer` (default `true`)
-   - `opencodeBridge.opencodePath` (default `"opencode"`)
-   - `opencodeBridge.model` (optional `providerID/modelID`, e.g. `anthropic/claude-3-5-sonnet-20241022`)
-   - `opencodeBridge.debug` (default `false`) — enable debug logging to the "OpenCode Bridge" Output channel and console.
+   - `opencodeBridge.port` (default `4096`) — used in external mode.
+   - `opencodeBridge.hostname` (default `127.0.0.1`) — used in external mode.
+   - `opencodeBridge.autoStartServer` (default `true`) — used in external mode.
+   - `opencodeBridge.opencodePath` (default `"opencode"`).
+   - `opencodeBridge.model` (optional `providerID/modelID`, e.g. `anthropic/claude-3-5-sonnet-20241022`).
+   - `opencodeBridge.debug` (default `false`) — enable debug logging.
+   - `opencodeBridge.serverMode` (`"managed"` or `"external"`, default `"managed"`).
 
 ## Requirements
 
@@ -48,7 +58,8 @@ to drive it.
 
 1. Download `opencode-bridge-0.1.0.vsix` (see [Building](#building)).
 2. In VS Code / VSCodium: **Extensions** → `...` → **Install from VSIX…** → select the file.
-3. Start an OpenCode server in a terminal:
+3. **Managed mode (default):** Nothing to start — the extension launches its own `opencode serve` automatically.
+   **External mode:** Set `opencodeBridge.serverMode` to `"external"` and start an OpenCode server:
    ```sh
    opencode serve --port 4096
    ```
@@ -82,37 +93,35 @@ Open **Settings** → **Extensions** → **OpenCode Bridge**, or edit `settings.
   "opencodeBridge.autoStartServer": true,
   "opencodeBridge.opencodePath": "opencode",
   "opencodeBridge.model": "",
-  "opencodeBridge.debug": false
+  "opencodeBridge.debug": false,
+  "opencodeBridge.serverMode": "managed"
 }
 ```
 
-### Basic auth
+## Password handling
 
-If your `opencode serve` was started with a password, set it via the secret store
-(preferred) or environment variable:
+### Managed mode (default)
 
-```sh
-# Option A: extension secret (per-machine, not written to settings.json)
-# Use the "OpenCode: Set Server Password" command to store it securely.
+No password configuration needed. The extension generates a random password
+(`crypto.randomBytes(24).toString('hex')`), starts its own `opencode serve`
+child with `OPENCODE_SERVER_PASSWORD` set in the child's environment only,
+and connects using Basic auth (`username: "opencode"`, `password: <random>`).
+The password is kept in memory only and is never logged.
 
-# Option B: environment variable (launch VS Code / VSCodium with this)
-export OPENCODE_SERVER_PASSWORD=your-password
-```
+### External mode
+
+If your `opencode serve` was started with a password, set it via:
+
+1. **VS Code secret store** (preferred): Run the **OpenCode: Set Server Password**
+   command from the Command Palette, or click the 🔑 button in the chat header.
+2. **Environment variable:** Launch VS Code / VSCodium with
+   `OPENCODE_SERVER_PASSWORD=your-password`.
 
 The extension sends `Authorization: Basic opencode:<password>`. The username is
 literally `opencode` (as required by the OpenCode server).
 
-The secret key is `opencodeBridge.serverPassword`. Use the
-**OpenCode: Set Server Password** command to store it in VS Code's secret
-storage without editing `settings.json`.
-
-## Usage
-
-- Click the **OpenCode Bridge** icon in the activity bar to open the chat sidebar.
-- Type a message and press **Enter** to send. **Shift+Enter** inserts a newline.
-- Click **New chat** to start a fresh session.
-- In the editor, select code, right-click → **OpenCode: Ask about selection**, then type your question.
-- Use **OpenCode: Add current file** from the editor title menu to include the whole file as context.
+The secret key is `opencodeBridge.serverPassword`. Use
+**OpenCode: Clear Server Password** to remove it.
 
 ## Commands
 
@@ -121,20 +130,32 @@ storage without editing `settings.json`.
 | `OpenCode: Open Chat` | `Ctrl+Alt+O` | activity bar |
 | `OpenCode: Ask about selection` | — | editor context menu |
 | `OpenCode: Add current file as context` | — | editor title |
-| `OpenCode: Set Server Password` | — | command palette |
+| `OpenCode: Set Server Password` | — | command palette / 🔑 button |
+| `OpenCode: Clear Server Password` | — | command palette |
+
+## Error handling
+
+- **401/403 (auth failures)** are never retried silently. In external mode,
+  the chat shows an "Enter password" button. In managed mode, this should
+  not happen since the extension generates its own password.
+- **Network errors, 502/503, and empty model snapshots** right after server
+  start are retried with exponential backoff for up to ~10s.
+- Every error is visible in the chat as a distinct message (with raw HTTP
+  status and response snippet) and logged in the "OpenCode Bridge" Output
+  channel (without secrets).
 
 ## Troubleshooting
 
 | Problem | Likely cause / fix |
 |---|---|
-| "No OpenCode server is running at …" | Start `opencode serve --port 4096` or enable `opencodeBridge.autoStartServer`. |
+| "No OpenCode server is running at …" (external mode) | Start `opencode serve --port 4096` or switch to managed mode. |
 | `opencode` binary not found | Install the OpenCode CLI or set `opencodeBridge.opencodePath` to its absolute path. |
-| Server doesn't become reachable within 10s | Check the Output panel (OpenCode Bridge) for server stderr; the port may be occupied by something else. |
-| Authentication required (401) | Set `OPENCODE_SERVER_PASSWORD` or the `opencodeBridge.serverPassword` secret. |
+| Server doesn't become reachable within 10s | Check the Output panel (OpenCode Bridge) for server stderr; the port may be occupied. |
+| Authentication required (401) | In external mode, set the password via **OpenCode: Set Server Password** or `OPENCODE_SERVER_PASSWORD`. |
 | No assistant reply streams in | OpenCode needs a reachable model provider (API keys configured). The extension itself never calls an LLM. |
 | Webview doesn't show / CSP errors | Reload the window; the webview uses a strict nonce-based CSP. |
 
 ## What this extension does NOT do
 
-It does **not** implement any LLM provider, API key handling, or model routing. All model inference happens inside the `opencode serve` process you run locally.
-
+It does **not** implement any LLM provider, API key handling, or model routing.
+All model inference happens inside the `opencode serve` process you run locally.

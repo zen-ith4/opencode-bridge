@@ -156,7 +156,12 @@ export class OpencodeBridgeClient {
     return await res.text();
   }
 
-  /** Fetch with exponential backoff retry. Retries for up to maxMs total. */
+  /**
+   * Fetch with exponential backoff retry. Retries only on network errors,
+   * 502/503, and an empty model snapshot right after startup. Does NOT
+   * retry on 401/403 (auth failures) — those need user action.
+   * Retries for up to maxMs total.
+   */
   private async fetchWithRetry(
     path: string,
     options: { method?: string; headers?: Record<string, string>; body?: unknown } = {},
@@ -169,13 +174,35 @@ export class OpencodeBridgeClient {
       try {
         return await this.fetchJSON(path, options);
       } catch (err) {
+        const msg = errorMessage(err);
+        // Never retry on auth failures — they need user action.
+        if (msg.startsWith("HTTP 401") || msg.startsWith("HTTP 403")) {
+          this.debugLog(`fetchWithRetry ${path} auth failure (${msg}), not retrying`);
+          throw err;
+        }
         lastErr = err;
-        this.debugLog(`fetchWithRetry ${path} failed (${errorMessage(err)}), retrying in ${delay}ms`);
+        this.debugLog(`fetchWithRetry ${path} failed (${msg}), retrying in ${delay}ms`);
         await new Promise((r) => setTimeout(r, delay));
         delay = Math.min(delay * 2, 2000);
       }
     }
     throw lastErr;
+  }
+
+  /** Update the auth header used for subsequent requests (e.g. after user enters a password). */
+  setAuthHeader(authHeader: string | undefined): void {
+    this.authHeader = authHeader;
+    if (authHeader) {
+      this.client = createOpencodeClient({
+        baseUrl: this.baseUrl,
+        headers: { Authorization: authHeader },
+      });
+    } else {
+      this.client = createOpencodeClient({
+        baseUrl: this.baseUrl,
+      });
+    }
+    this.debugLog(`Auth header updated (${authHeader ? "set" : "cleared"})`);
   }
 
   /** Unwrap hey-api's double-wrapped create-session response. */
