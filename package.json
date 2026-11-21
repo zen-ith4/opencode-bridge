@@ -1,0 +1,141 @@
+{
+  "name": "opencode-bridge",
+  "type": "module",
+  "displayName": "OpenCode Bridge",
+  "description": "Chat client for OpenCode (opencode.ai). Connects to a local `opencode serve` HTTP server; does not call any LLM API itself.",
+  "version": "0.1.0",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "publisher": "opencode-bridge",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:opencode-bridge.openChat",
+    "onCommand:opencode-bridge.askSelection",
+    "onCommand:opencode-bridge.addFileContext"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "opencode-bridge.openChat",
+        "title": "OpenCode: Open Chat",
+        "icon": "$(comment)"
+      },
+      {
+        "command": "opencode-bridge.askSelection",
+        "title": "OpenCode: Ask about selection",
+        "icon": "$(comment-add)"
+      },
+      {
+        "command": "opencode-bridge.addFileContext",
+        "title": "OpenCode: Add current file as context"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "opencode-bridge.openChat",
+        "key": "ctrl+shift+o",
+        "mac": "cmd+shift+o",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "opencode-bridge.openChat",
+        "key": "ctrl+shift+o",
+        "mac": "cmd+shift+o",
+        "when": "explorerTextFocus"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencode-bridge-sidebar",
+          "title": "OpenCode Bridge",
+          "icon": "media/icon.png"
+        }
+      ]
+    },
+    "views": {
+      "opencode-bridge-sidebar": [
+        {
+          "id": "opencode-bridge.chat",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "opencode-bridge.askSelection",
+          "when": "editorHasSelection && resourceLangId != null",
+          "group": "opencode"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "opencode-bridge.addFileContext",
+          "when": "editorHasSelection",
+          "group": "navigation",
+          "icon": "$(comment-add)"
+        }
+      ]
+    },
+    "configuration": {
+      "type": "object",
+      "title": "OpenCode Bridge configuration",
+      "properties": {
+        "opencodeBridge.port": {
+          "type": "number",
+          "default": 4096,
+          "description": "Port the local `opencode serve` HTTP server listens on."
+        },
+        "opencodeBridge.hostname": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Hostname of the local `opencode serve` HTTP server."
+        },
+        "opencodeBridge.autoStartServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically spawn `opencode serve` when no server is running at the configured host/port."
+        },
+        "opencodeBridge.opencodePath": {
+          "type": "string",
+          "default": "opencode",
+          "description": "Path or name of the `opencode` binary (must be in PATH unless an absolute path is given)."
+        },
+        "opencodeBridge.model": {
+          "type": "string",
+          "default": "",
+          "description": "Optional model as providerID/modelID (e.g. anthropic/claude-3-5-sonnet-20241022). If empty, OpenCode's own default model is used."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "lint": "eslint src --ext .ts",
+    "package:vsix": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "@vscode/vsce": "^4.1.1",
+    "esbuild": "^0.19.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.19.6"
+  }
+}

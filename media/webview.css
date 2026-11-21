@@ -1,0 +1,241 @@
+/**
+ * OpenCode Bridge - webview styles.
+ *
+ * Uses VS Code CSS theme variables so the chat follows light/dark themes.
+ * Variables fall back to sensible defaults if not defined.
+ */
+
+:root {
+  --oc-bg: var(--vscode-editor-background, #1e1e1e);
+  --oc-panel: var(--vscode-sideBar-background, #252526);
+  --oc-text: var(--vscode-editor-foreground, #cccccc);
+  --oc-muted: var(--vscode-descriptionForeground, #858585);
+  --oc-border: var(--vscode-panel-border, #3c3c3c);
+  --oc-user-bg: var(--vscode-input-background, #3c3c3c);
+  --oc-assistant-bg: var(--vscode-widget-background, #2d2d2d);
+  --oc-accent: var(--vscode-button-background, #0e639c);
+  --oc-accent-hover: var(--vscode-button-hoverBackground, #1177d1);
+  --oc-code-bg: var(--vscode-textBlockQuote-background, #252526);
+  --oc-code-border: var(--vscode-editorWidget-border, #3c3c3c);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--oc-text);
+  background: var(--oc-panel);
+  overflow: hidden;
+}
+
+.chat-container {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 8px;
+}
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--oc-border);
+  padding-bottom: 8px;
+  flex-shrink: 0;
+}
+
+.title {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--oc-text);
+}
+
+.subtitle {
+  font-size: 11px;
+  color: var(--oc-muted);
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+}
+
+button {
+  background: var(--oc-accent);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+button:hover { background: var(--oc-accent-hover); }
+button:active { transform: translateY(1px); }
+button.secondary { background: var(--oc-user-bg); color: var(--oc-text); }
+button.secondary:hover { background: var(--oc-border); }
+
+.messages {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 4px;
+  scroll-behavior: smooth;
+}
+
+.message {
+  display: flex;
+  flex-direction: column;
+  max-width: 100%;
+}
+
+.message.user { align-self: flex-end; }
+.message.assistant { align-self: flex-start; }
+
+.bubble {
+  padding: 8px 12px;
+  border-radius: 10px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.message.user .bubble {
+  background: var(--oc-user-bg);
+  color: var(--oc-text);
+  border: 1px solid var(--oc-border);
+  border-bottom-right-radius: 2px;
+}
+
+.message.assistant .bubble {
+  background: var(--oc-assistant-bg);
+  color: var(--oc-text);
+  border: 1px solid var(--oc-border);
+  border-bottom-left-radius: 2px;
+}
+
+.meta {
+  font-size: 10px;
+  color: var(--oc-muted);
+  margin-top: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.pulse {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background: var(--oc-accent);
+  border-radius: 50%;
+  animation: pulse 1.4s infinite;
+  margin-left: 4px;
+}
+
+@keyframes pulse {
+  0% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.3); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+.status {
+  font-size: 11px;
+  color: var(--oc-muted);
+  height: 18px;
+  flex-shrink: 0;
+  animation: fadein 0.2s;
+}
+
+@keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+
+.status.error { color: var(--vscode-errorForeground, #f48771); }
+
+.composer {
+  display: flex;
+  gap: 8px;
+  border-top: 1px solid var(--oc-border);
+  padding-top: 8px;
+  flex-shrink: 0;
+}
+
+textarea {
+  flex: 1;
+  resize: none;
+  font-family: inherit;
+  font-size: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--oc-border);
+  border-radius: 6px;
+  background: var(--oc-user-bg);
+  color: var(--oc-text);
+  outline: none;
+  line-height: 1.5;
+}
+
+textarea::placeholder { color: var(--oc-muted); }
+textarea:focus { border-color: var(--oc-accent); }
+
+/* Code blocks */
+.code-block {
+  margin: 6px 0 4px 0;
+  border: 1px solid var(--oc-code-border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--oc-code-bg);
+}
+
+.code-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 8px;
+  background: var(--oc-panel);
+  border-bottom: 1px solid var(--oc-code-border);
+  font-size: 11px;
+  color: var(--oc-muted);
+}
+
+.code-lang { font-family: var(--vscode-editor-font-family, monospace); }
+
+.copy-btn {
+  background: var(--oc-user-bg);
+  color: var(--oc-text);
+  font-size: 10px;
+  padding: 2px 8px;
+  border: 1px solid var(--oc-border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.copy-btn:hover { background: var(--oc-border); }
+
+code { font-family: var(--vscode-editor-font-family, monospace); font-size: 11.5px; }
+pre { margin: 0; font-family: var(--vscode-editor-font-family, monospace); font-size: 11.5px; }
+
+a { color: var(--oc-accent); text-decoration: underline; }
+
+/* Light theme tweaks */
+body.light, body[data-theme="light"] {
+  --oc-bg: #ffffff;
+  --oc-panel: #f3f3f3;
+  --oc-text: #1c1c1c;
+  --oc-muted: #6a6a6a;
+  --oc-border: #d4d4d4;
+  --oc-user-bg: #e7e7e7;
+  --oc-assistant-bg: #ffffff;
+  --oc-code-bg: #f0f0f0;
+}
+
+/* High-contrast */
+@media (forced-colors: active) {
+  button { forced-color-adjust: auto; }
+}
