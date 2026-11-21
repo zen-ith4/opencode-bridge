@@ -18,9 +18,10 @@
   const modelSelect = document.getElementById("modelSelect");
   const serverInfo = document.getElementById("serverInfo");
   const btnKey = document.getElementById("btnKey");
+  const modelSearch = document.getElementById("modelSearch");
   const composer = document.getElementById("composer");
 
-  if (!messagesEl || !inputEl || !btnSend || !composer || !modelSelect || !serverInfo) {
+  if (!messagesEl || !inputEl || !btnSend || !composer || !modelSelect || !serverInfo || !modelSearch) {
     console.error("OpenCode Bridge: required DOM elements missing");
     return;
   }
@@ -31,6 +32,7 @@
   let availableModels = []; // { id, label, providerID, modelID }
   let currentMode = "managed";
   let awaitingPassword = false;
+  let modelSearchText = "";
 
   /* ---------- Escape HTML ---------- */
   function escapeHtml(text) {
@@ -104,14 +106,32 @@
     defaultOpt.value = "";
     defaultOpt.textContent = "Default model (server default)";
     modelSelect.appendChild(defaultOpt);
+
+    const term = modelSearchText.toLowerCase();
+    let shown = 0;
     for (const m of availableModels) {
+      const haystack = `${m.label} ${m.providerID} ${m.modelID}`.toLowerCase();
+      if (term && !haystack.includes(term)) continue;
       const opt = document.createElement("option");
       opt.value = JSON.stringify({ providerID: m.providerID, modelID: m.modelID });
       opt.textContent = `${m.label} (${m.providerID})`;
       modelSelect.appendChild(opt);
+      shown++;
     }
-    modelSelect.disabled = availableModels.length === 0;
+    modelSelect.disabled = shown === 0;
+    if (shown === 0) {
+      const noOpt = document.createElement("option");
+      noOpt.value = "";
+      noOpt.textContent = "No matching models";
+      noOpt.disabled = true;
+      modelSelect.appendChild(noOpt);
+    }
   }
+
+  modelSearch.addEventListener("input", (ev) => {
+    modelSearchText = ev.target.value || "";
+    renderModelDropdown();
+  });
 
   modelSelect.addEventListener("change", () => {
     const val = modelSelect.value;

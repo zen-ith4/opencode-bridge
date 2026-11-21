@@ -556,6 +556,7 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       <div class="title">OpenCode Bridge</div>
       <div class="subtitle">Local <code>opencode serve</code> chat</div>
       <div class="actions">
+        <input type="text" id="modelSearch" placeholder="Search models…" aria-label="Search models" />
         <select id="modelSelect" title="Model" aria-label="Model"></select>
         <span id="serverInfo" class="server-info" title=""></span>
         <button id="btnKey" title="Set server password" style="display:none">🔑</button>
