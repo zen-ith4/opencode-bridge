@@ -6,7 +6,6 @@ out/
 *.vsix
 
 # IDE
-.vscode/
 *.code-workspace
 
 # OS
