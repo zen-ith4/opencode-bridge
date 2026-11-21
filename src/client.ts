@@ -156,6 +156,28 @@ export class OpencodeBridgeClient {
     return await res.text();
   }
 
+  /** Fetch with exponential backoff retry. Retries for up to maxMs total. */
+  private async fetchWithRetry(
+    path: string,
+    options: { method?: string; headers?: Record<string, string>; body?: unknown } = {},
+    maxMs = 10_000
+  ): Promise<any> {
+    const deadline = Date.now() + maxMs;
+    let lastErr: unknown = null;
+    let delay = 500;
+    while (Date.now() < deadline) {
+      try {
+        return await this.fetchJSON(path, options);
+      } catch (err) {
+        lastErr = err;
+        this.debugLog(`fetchWithRetry ${path} failed (${errorMessage(err)}), retrying in ${delay}ms`);
+        await new Promise((r) => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 2000);
+      }
+    }
+    throw lastErr;
+  }
+
   /** Unwrap hey-api's double-wrapped create-session response. */
   private unwrapSession(resp: unknown): BridgeSession | null {
     const outer = (resp as { data?: unknown })?.data;
@@ -247,8 +269,10 @@ export class OpencodeBridgeClient {
     this.requireClient();
     try {
       this.debugLog("Fetching providers from /api/provider");
-      const resp = await this.fetchJSON("/provider", { method: "GET" });
-      const arr = resp && typeof resp === "object" && "data" in resp ? (resp as Record<string, unknown>).data : null;
+      const resp = await this.fetchWithRetry("/provider", { method: "GET" });
+      // Real server response (single-wrapped): { location, data: [...] }
+      // hey-api SDK-wrapped responses (double-wrapped): { data: { data: [...] }, ... }
+      const arr = this.extractDataArray(resp);
       const providers: BridgeProvider[] = [];
       if (Array.isArray(arr)) {
         for (const p of arr) {
@@ -263,8 +287,9 @@ export class OpencodeBridgeClient {
       this.debugLog(`Found ${providers.length} providers`);
       return providers;
     } catch (err) {
-      this.debugLog(`getProviders failed: ${errorMessage(err)}`);
-      throw new Error(`Failed to list providers: ${errorMessage(err)}`);
+      const msg = errorMessage(err);
+      this.debugLog(`getProviders failed: ${msg}`);
+      throw new Error(`Failed to list providers (GET /api/provider): ${msg}`);
     }
   }
 
@@ -273,8 +298,10 @@ export class OpencodeBridgeClient {
     this.requireClient();
     try {
       this.debugLog("Fetching models from /api/model");
-      const resp = await this.fetchJSON("/model", { method: "GET" });
-      const arr = resp && typeof resp === "object" && "data" in resp ? (resp as Record<string, unknown>).data : null;
+      const resp = await this.fetchWithRetry("/model", { method: "GET" });
+      // Real server response (single-wrapped): { location, data: [...] }
+      // hey-api SDK-wrapped responses (double-wrapped): { data: { data: [...] }, ... }
+      const arr = this.extractDataArray(resp);
       const models: BridgeModel[] = [];
       if (Array.isArray(arr)) {
         for (const m of arr) {
@@ -291,9 +318,27 @@ export class OpencodeBridgeClient {
       this.debugLog(`Found ${models.length} models`);
       return models;
     } catch (err) {
-      this.debugLog(`getModels failed: ${errorMessage(err)}`);
-      throw new Error(`Failed to list models: ${errorMessage(err)}`);
+      const msg = errorMessage(err);
+      this.debugLog(`getModels failed: ${msg}`);
+      throw new Error(`Failed to list models (GET /api/model): ${msg}`);
     }
+  }
+
+  /**
+   * Extract the data array from a server response, handling both:
+   *  - Real server single-wrap: { location, data: [...] }
+   *  - hey-api SDK double-wrap: { data: { data: [...] }, request, response }
+   */
+  private extractDataArray(resp: unknown): unknown[] | null {
+    if (!resp || typeof resp !== "object") return null;
+    const obj = resp as Record<string, unknown>;
+    const data = obj.data;
+    if (Array.isArray(data)) return data;
+    // hey-api double-wrap: { data: { data: [...] } }
+    if (data && typeof data === "object" && "data" in data && Array.isArray((data as Record<string, unknown>).data)) {
+      return (data as Record<string, unknown>).data as unknown[];
+    }
+    return null;
   }
 
   /** Get the default model from /api/model/default. */

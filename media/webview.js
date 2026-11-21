@@ -16,6 +16,7 @@
   const btnRetry = document.getElementById("btnRetry");
   const statusEl = document.getElementById("status");
   const modelSelect = document.getElementById("modelSelect");
+  const serverInfo = document.getElementById("serverInfo");
   const composer = document.getElementById("composer");
 
   if (!messagesEl || !inputEl || !btnSend || !composer || !modelSelect) {
@@ -263,6 +264,23 @@
         currentSessionID = msg.sessionID ?? null;
         availableModels = msg.models || [];
         renderModelDropdown();
+        // Show server URL and working directory in the header tooltip.
+        if (serverInfo) {
+          const parts = [];
+          if (msg.serverUrl) parts.push(`Server: ${msg.serverUrl}`);
+          if (msg.workspaceDir) parts.push(`Workspace: ${msg.workspaceDir}`);
+          serverInfo.textContent = parts.join("  |  ");
+          serverInfo.title = parts.join("\n");
+          serverInfo.style.display = parts.length ? "inline-block" : "none";
+        }
+        // If there was a provider/model load error, show it as an error bubble.
+        if (msg.providersError) {
+          const errDiv = document.createElement("div");
+          errDiv.className = "message system-error";
+          errDiv.innerHTML = `<div class="bubble error-bubble">⚠ Failed to load models/providers: ${escapeHtml(msg.providersError)}</div>`;
+          messagesEl.appendChild(errDiv);
+          scrollToBottom();
+        }
         if (msg.selectedModel) {
           // Select matching option
           for (let i = 0; i < modelSelect.options.length; i++) {
@@ -330,10 +348,13 @@
         noOpt.disabled = true;
         modelSelect.appendChild(noOpt);
         modelSelect.disabled = true;
-        // Show an info bubble
+        // Show an info bubble with raw error details if available.
         const infoDiv = document.createElement("div");
         infoDiv.className = "message system-error";
         infoDiv.innerHTML = `<div class="bubble error-bubble">⚠ No model providers are connected to OpenCode. Open OpenCode and run <code>/connect</code> to add a provider (e.g. Anthropic, OpenAI), then refresh this view.</div>`;
+        if (msg.providersError) {
+          infoDiv.innerHTML += `<details><summary>Details</summary><pre>${escapeHtml(msg.providersError)}</pre></details>`;
+        }
         messagesEl.appendChild(infoDiv);
         scrollToBottom();
         break;

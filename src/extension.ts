@@ -147,6 +147,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     extensionPath: context.extensionPath,
     sessionID: currentSessionID,
     debug: settings.debug,
+    serverUrl: baseUrl,
+    workspaceDir: firstWorkspaceFolder(),
   });
   if (selectedModel) {
     chatView.setSelectedModel(selectedModel);

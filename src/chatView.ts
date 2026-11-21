@@ -27,10 +27,12 @@ export interface ChatViewOptions {
   extensionPath: string;
   sessionID?: string; // resume this session while VS Code is open
   debug?: boolean;
+  serverUrl?: string; // e.g. http://127.0.0.1:4096/api
+  workspaceDir?: string; // first workspace folder path
 }
 
 type WebviewMessage =
-  | { type: "init"; sessionID?: string; models: any[]; selectedModel?: { providerID: string; modelID: string } | null }
+  | { type: "init"; sessionID?: string; models: any[]; selectedModel?: { providerID: string; modelID: string } | null; serverUrl?: string; workspaceDir?: string | undefined; providersError?: string | null }
   | { type: "status"; status: "idle" | "loading" | "error" | "thinking"; message?: string }
   | { type: "assistant-start"; messageID: string; sessionID?: string }
   | { type: "assistant-delta"; messageID: string; delta: string; text: string }
@@ -47,6 +49,8 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
   private readonly client: OpencodeBridgeClient;
   private readonly extensionPath: string;
   private readonly debug: boolean;
+  private readonly serverUrl: string;
+  private readonly workspaceDir: string | undefined;
   private _view?: vscode.WebviewView;
   private currentSessionID: string | undefined;
   private selectedModel: { providerID: string; modelID: string } | null = null;
@@ -59,6 +63,8 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
     this.client = opts.client;
     this.extensionPath = opts.extensionPath;
     this.debug = opts.debug ?? false;
+    this.serverUrl = opts.serverUrl ?? "";
+    this.workspaceDir = opts.workspaceDir;
     if (opts.sessionID) this.currentSessionID = opts.sessionID;
     this.client.setDebug(this.debug);
   }
@@ -123,6 +129,8 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       sessionID: this.currentSessionID,
       models: [],
       selectedModel: model ?? null,
+      serverUrl: this.serverUrl,
+      workspaceDir: this.workspaceDir,
     });
   }
 
@@ -243,6 +251,7 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
 
   private async postInit(): Promise<void> {
     let models: any[] = [];
+    let providersError: string | null = null;
     try {
       const providerModels = await this.client.getModels();
       models = providerModels.map((m) => ({
@@ -251,11 +260,21 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
         providerID: m.providerID,
         modelID: m.modelID,
       }));
+      this.debugLog(`Loaded ${models.length} models for dropdown`);
     } catch (err) {
-      this.debugLog(`Failed to load models for init: ${errorMessage(err)}`);
-      // If no providers, tell the webview.
-      const providers = await this.client.getProviders().catch(() => [] as BridgeProvider[]);
-      if (providers.length === 0) {
+      const msg = errorMessage(err);
+      this.debugLog(`Failed to load models for init: ${msg}`);
+      logError(`Failed to load models (GET /api/model): ${msg}`);
+      providersError = msg;
+      // Fall back to providers list to determine if any providers exist at all.
+      try {
+        const providers = await this.client.getProviders();
+        if (providers.length === 0) {
+          this.postToWebview({ type: "no-providers" });
+        }
+      } catch (provErr) {
+        providersError = errorMessage(provErr);
+        logError(`Failed to list providers (GET /api/provider): ${providersError}`);
         this.postToWebview({ type: "no-providers" });
       }
     }
@@ -264,6 +283,9 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       sessionID: this.currentSessionID,
       models,
       selectedModel: this.selectedModel ?? null,
+      serverUrl: this.serverUrl,
+      workspaceDir: this.workspaceDir,
+      providersError,
     });
   }
 
@@ -464,6 +486,7 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       <div class="subtitle">Local <code>opencode serve</code> chat</div>
       <div class="actions">
         <select id="modelSelect" title="Model" aria-label="Model"></select>
+        <span id="serverInfo" class="server-info" title=""></span>
         <button id="btnNewChat" title="New chat">&#128214;</button>
         <button id="btnRetry" title="Retry" style="display:none">&#x21BB;</button>
       </div>
