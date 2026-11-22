@@ -1,33 +1,36 @@
 /**
  * OpenCode Bridge - SDK wrapper around `@opencode-ai/sdk`.
  *
- * Verified against the installed package type definitions (v1 client,
- * `createOpencodeClient({ baseUrl, headers })`) and against a live
- * `opencode serve` instance (v2.3.0).
- *
- * Important wiring notes (empirically verified against the OpenAPI spec):
- *  - All server routes live under `/api`, so baseUrl must be
+ * Verified against the installed package type definitions and a live
+ * `opencode serve` (v2.3.0) / its OpenAPI document:
+ *  - All server routes live under `/api`, so baseUrl is
  *    `http://host:port/api`.
- *  - `createOpencodeClient({ baseUrl, headers })` from `@opencode-ai/sdk` is
- *    used as required. Its `session.create()` and `event.subscribe()` work
- *    through the SDK.
- *  - The SDK's `session.prompt()` targets `POST /session/{id}/message`, but
- *    the server exposes `POST /api/session/{sessionID}/prompt`. For prompt,
- *    providers, models, and session model we use raw `fetch` with the
- *    auth header, since the SDK's generated paths don't match this server
- *    version.
- *  - Prompt request body is `{ text, model? }` (NOT `{ parts: [] }`).
- *  - SSE: `client.event.subscribe({ onSseEvent })` → `/api/event`, yields
- *    `{ id, type, data }` events: session.text.started / delta / ended,
- *    session.execution.started / succeeded / failed, session.created.
+ *  - `createOpencodeClient({ baseUrl, headers })` is used for session
+ *    creation (`client.session.create()`).
+ *  - The server exposes raw routes that differ from this SDK version
+ *    (`/api/session/{id}/prompt`, `/api/session/{id}/interrupt`,
+ *    `/api/session/{id}/message`, `/api/event`), so those use raw `fetch`
+ *    with the same auth header.
+ *  - Prompt body is `{ text, model?: { id, providerID } }`.
+ *  - SSE payloads look like
+ *      data: {"id":"evt_...","type":"session.text.delta","data":{...}}
+ *    with the type INSIDE the JSON (no SSE `event:` line). Text chunks are
+ *    in `data.delta`.
  *
- * This wrapper never calls any LLM API itself; it only talks to the local
- * OpenCode HTTP server.
+ * This wrapper never calls any LLM API itself.
  */
 
 import { createOpencodeClient } from "@opencode-ai/sdk";
 import type { OpencodeClient } from "@opencode-ai/sdk";
-import { logDebug } from "./server.js";
+import { logDebug } from "./log.js";
+import {
+  BridgeEvent,
+  isAuthError,
+  parseSseBlock,
+} from "./events.js";
+
+export type { BridgeEvent, TextDelta } from "./events.js";
+export { extractTextDelta, shouldHandleEvent } from "./events.js";
 
 /** A session known to the OpenCode server. */
 export interface BridgeSession {
@@ -53,29 +56,44 @@ export interface BridgeModel {
   name: string;
 }
 
-/** Incremental assistant text delta from the SSE stream. */
-export interface StreamPart {
-  messageID: string;
-  sessionID: string;
-  text: string; // newly arrived text chunk
+/** A message restored from GET /api/session/{id}/message. */
+export interface BridgeMessage {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  created?: number;
 }
 
-/** A parsed SSE event relevant to chat rendering. */
-export interface BridgeEvent {
-  type: string; // e.g. "session.text.delta", "session.execution.succeeded"
-  data: unknown;
-  sessionID?: string;
+export interface ModelRef {
+  providerID: string;
+  modelID: string;
 }
 
 interface PromptOptions {
   sessionID: string;
   text: string;
-  model?: { providerID: string; modelID: string };
+  model?: ModelRef;
+}
+
+/** Truncate a server response snippet for error messages. */
+function snippet(text: string, max = 300): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length > max ? clean.slice(0, max) + "…" : clean;
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }
 
 /**
- * Thin wrapper. All methods are wrapped in try/catch and translate failures
- * into user-friendly Error messages.
+ * Thin wrapper. All methods translate failures into user-friendly Error
+ * messages that include the HTTP status and a short response snippet.
  */
 export class OpencodeBridgeClient {
   private client: OpencodeClient | null = null;
@@ -88,7 +106,10 @@ export class OpencodeBridgeClient {
     this.debug = debug;
   }
 
-  /** Enable/disable debug logging. */
+  getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
   setDebug(debug: boolean): void {
     this.debug = debug;
   }
@@ -97,19 +118,33 @@ export class OpencodeBridgeClient {
     logDebug(message, this.debug);
   }
 
+  private makeSdkClient(): OpencodeClient {
+    const headers: Record<string, string> = {};
+    if (this.authHeader) headers.Authorization = this.authHeader;
+    return createOpencodeClient({ baseUrl: this.baseUrl, headers });
+  }
+
   /** Create (or reconnect) the SDK client with an optional Basic auth header. */
   connect(authHeader?: string): void {
     this.authHeader = authHeader;
-    const headers: Record<string, string> = {};
-    if (authHeader) headers.Authorization = authHeader;
-    this.client = createOpencodeClient({
-      baseUrl: this.baseUrl,
-      headers,
-    });
+    this.client = this.makeSdkClient();
     this.debugLog(`SDK client connected to ${this.baseUrl}`);
   }
 
-  /** Ensure a client exists. */
+  /** Point the client at another base URL (used after a managed restart). */
+  setBaseUrl(baseUrl: string): void {
+    this.baseUrl = baseUrl;
+    if (this.client) this.client = this.makeSdkClient();
+    this.debugLog(`Base URL updated to ${baseUrl}`);
+  }
+
+  /** Update the auth header used for subsequent requests. */
+  setAuthHeader(authHeader: string | undefined): void {
+    this.authHeader = authHeader;
+    if (this.client) this.client = this.makeSdkClient();
+    this.debugLog(`Auth header updated (${authHeader ? "set" : "cleared"})`);
+  }
+
   private requireClient(): OpencodeClient {
     if (!this.client) {
       throw new Error(
@@ -128,39 +163,30 @@ export class OpencodeBridgeClient {
     const headers: Record<string, string> = {};
     if (this.authHeader) headers.Authorization = this.authHeader;
     if (options.headers) {
-      for (const [k, v] of Object.entries(options.headers)) {
-        headers[k] = String(v);
-      }
+      for (const [k, v] of Object.entries(options.headers)) headers[k] = String(v);
     }
     let body = options.body;
     if (body !== undefined && typeof body === "object" && !(body instanceof FormData)) {
       headers["Content-Type"] = "application/json";
       body = JSON.stringify(body);
     }
-    const fetchOptions: RequestInit = {
-      method: options.method ?? "GET",
-      headers,
-    };
+    const fetchOptions: RequestInit = { method: options.method ?? "GET", headers };
     if (body !== undefined) fetchOptions.body = body as unknown as string;
 
     this.debugLog(`fetch ${options.method ?? "GET"} ${path}`);
     const res = await fetch(url, fetchOptions);
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+      throw new Error(`HTTP ${res.status}: ${snippet(text) || res.statusText}`);
     }
     const contentType = res.headers.get("content-type") ?? "";
-    if (contentType.includes("application/json")) {
-      return res.json();
-    }
+    if (contentType.includes("application/json")) return res.json();
     return await res.text();
   }
 
   /**
-   * Fetch with exponential backoff retry. Retries only on network errors,
-   * 502/503, and an empty model snapshot right after startup. Does NOT
-   * retry on 401/403 (auth failures) — those need user action.
-   * Retries for up to maxMs total.
+   * Retry with exponential backoff for up to maxMs. Retries only network
+   * errors and 502/503. NEVER retries 401/403 (those need the user action).
    */
   private async fetchWithRetry(
     path: string,
@@ -175,37 +201,27 @@ export class OpencodeBridgeClient {
         return await this.fetchJSON(path, options);
       } catch (err) {
         const msg = errorMessage(err);
-        // Never retry on auth failures — they need user action.
-        if (msg.startsWith("HTTP 401") || msg.startsWith("HTTP 403")) {
+        if (isAuthError(err)) {
           this.debugLog(`fetchWithRetry ${path} auth failure (${msg}), not retrying`);
+          throw err;
+        }
+        const statusMatch = /^HTTP (\d{3})/.exec(msg);
+        const status = statusMatch ? Number(statusMatch[1]) : 0;
+        const retryable = status === 0 || status === 502 || status === 503;
+        if (!retryable) {
+          this.debugLog(`fetchWithRetry ${path} non-retryable error (${msg})`);
           throw err;
         }
         lastErr = err;
         this.debugLog(`fetchWithRetry ${path} failed (${msg}), retrying in ${delay}ms`);
         await new Promise((r) => setTimeout(r, delay));
-        delay = Math.min(delay * 2, 2000);
+        delay = Math.min(delay * 2, 2_000);
       }
     }
-    throw lastErr;
+    throw lastErr ?? new Error(`Request to ${path} timed out`);
   }
 
-  /** Update the auth header used for subsequent requests (e.g. after user enters a password). */
-  setAuthHeader(authHeader: string | undefined): void {
-    this.authHeader = authHeader;
-    if (authHeader) {
-      this.client = createOpencodeClient({
-        baseUrl: this.baseUrl,
-        headers: { Authorization: authHeader },
-      });
-    } else {
-      this.client = createOpencodeClient({
-        baseUrl: this.baseUrl,
-      });
-    }
-    this.debugLog(`Auth header updated (${authHeader ? "set" : "cleared"})`);
-  }
-
-  /** Unwrap hey-api's double-wrapped create-session response. */
+  /** Unwrap session create responses (single or double wrapped). */
   private unwrapSession(resp: unknown): BridgeSession | null {
     const outer = (resp as { data?: unknown })?.data;
     const inner =
@@ -233,22 +249,22 @@ export class OpencodeBridgeClient {
   async createSession(opts: {
     title?: string;
     directory?: string;
-    model?: { providerID: string; modelID: string };
+    model?: ModelRef;
   }): Promise<BridgeSession> {
     const client = this.requireClient();
     try {
-      this.debugLog(`Creating session: title=${opts.title ?? "New chat"} directory=${opts.directory ?? "-"}`);
+      this.debugLog(`Creating session: title=${opts.title ?? "New chat"}`);
       const resp = await client.session.create({
         body: {
           title: opts.title ?? "New chat",
           ...(opts.directory ? { directory: opts.directory } : {}),
-          ...(opts.model ? { model: { id: opts.model.modelID, providerID: opts.model.providerID } } : {}),
+          ...(opts.model
+            ? { model: { id: opts.model.modelID, providerID: opts.model.providerID } }
+            : {}),
         },
       });
       const session = this.unwrapSession(resp);
-      if (!session || !session.id) {
-        throw new Error("Server did not return a session id.");
-      }
+      if (!session || !session.id) throw new Error("Server did not return a session id.");
       this.debugLog(`Session created: id=${session.id}`);
       return session;
     } catch (err) {
@@ -258,36 +274,48 @@ export class OpencodeBridgeClient {
   }
 
   /**
-   * Send a user prompt to an existing session. Uses the server's
-   * `POST /api/session/{id}/prompt` endpoint with body `{ text, model? }`.
-   * Non-blocking with respect to the UI: returns once the server accepts
-   * the message. The assistant's streamed reply arrives via
-   * subscribeToEvents().
+   * Send a user prompt via `POST /api/session/{id}/prompt`.
+   * Returns once the server accepts the message; the reply streams in via
+   * `streamEvents()`.
    */
   async prompt(opts: PromptOptions): Promise<{ messageID: string }> {
-    this.requireClient(); // ensure connected
+    this.requireClient();
     try {
-      this.debugLog(`Sending prompt to session ${opts.sessionID}: ${opts.text.slice(0, 80)}...`);
+      this.debugLog(`Sending prompt to session ${opts.sessionID} (${opts.text.length} chars)`);
       const body: Record<string, unknown> = { text: opts.text };
-      if (opts.model) {
-        // The server's Model.Ref schema uses { id, providerID } for model
-        // references in prompt/session bodies.
-        body.model = { id: opts.model.modelID, providerID: opts.model.providerID };
-      }
+      if (opts.model) body.model = { id: opts.model.modelID, providerID: opts.model.providerID };
       const resp = await this.fetchJSON(`/session/${encodeURIComponent(opts.sessionID)}/prompt`, {
         method: "POST",
         body,
       });
-      // Response: { data: { id, sessionID, type, payload, delivery }, ... }
-      const payload = resp && typeof resp === "object" && "data" in resp ? (resp as Record<string, unknown>).data : null;
-      const messageID = payload && typeof payload === "object" && "id" in payload
-        ? String((payload as Record<string, unknown>).id ?? "")
-        : "";
+      const payload =
+        resp && typeof resp === "object" && "data" in resp
+          ? (resp as Record<string, unknown>).data
+          : null;
+      const messageID =
+        payload && typeof payload === "object" && "id" in payload
+          ? String((payload as Record<string, unknown>).id ?? "")
+          : "";
       this.debugLog(`Prompt accepted: messageID=${messageID}`);
       return { messageID };
     } catch (err) {
       this.debugLog(`prompt failed: ${errorMessage(err)}`);
       throw new Error(`Failed to send prompt to OpenCode: ${errorMessage(err)}`);
+    }
+  }
+
+  /** Interrupt the active execution for a session (Stop button). */
+  async interrupt(sessionID: string): Promise<void> {
+    this.requireClient();
+    try {
+      await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/interrupt`, {
+        method: "POST",
+        body: {},
+      });
+      this.debugLog(`Session ${sessionID} interrupted`);
+    } catch (err) {
+      this.debugLog(`interrupt failed: ${errorMessage(err)}`);
+      throw new Error(`Failed to stop OpenCode: ${errorMessage(err)}`);
     }
   }
 
@@ -297,8 +325,6 @@ export class OpencodeBridgeClient {
     try {
       this.debugLog("Fetching providers from /api/provider");
       const resp = await this.fetchWithRetry("/provider", { method: "GET" });
-      // Real server response (single-wrapped): { location, data: [...] }
-      // hey-api SDK-wrapped responses (double-wrapped): { data: { data: [...] }, ... }
       const arr = this.extractDataArray(resp);
       const providers: BridgeProvider[] = [];
       if (Array.isArray(arr)) {
@@ -314,9 +340,7 @@ export class OpencodeBridgeClient {
       this.debugLog(`Found ${providers.length} providers`);
       return providers;
     } catch (err) {
-      const msg = errorMessage(err);
-      this.debugLog(`getProviders failed: ${msg}`);
-      throw new Error(`Failed to list providers (GET /api/provider): ${msg}`);
+      throw new Error(`Failed to list providers (GET /api/provider): ${errorMessage(err)}`);
     }
   }
 
@@ -326,8 +350,6 @@ export class OpencodeBridgeClient {
     try {
       this.debugLog("Fetching models from /api/model");
       const resp = await this.fetchWithRetry("/model", { method: "GET" });
-      // Real server response (single-wrapped): { location, data: [...] }
-      // hey-api SDK-wrapped responses (double-wrapped): { data: { data: [...] }, ... }
       const arr = this.extractDataArray(resp);
       const models: BridgeModel[] = [];
       if (Array.isArray(arr)) {
@@ -345,45 +367,38 @@ export class OpencodeBridgeClient {
       this.debugLog(`Found ${models.length} models`);
       return models;
     } catch (err) {
-      const msg = errorMessage(err);
-      this.debugLog(`getModels failed: ${msg}`);
-      throw new Error(`Failed to list models (GET /api/model): ${msg}`);
+      throw new Error(`Failed to list models (GET /api/model): ${errorMessage(err)}`);
     }
   }
 
   /**
    * Extract the data array from a server response, handling both:
    *  - Real server single-wrap: { location, data: [...] }
-   *  - hey-api SDK double-wrap: { data: { data: [...] }, request, response }
+   *  - hey-api SDK double-wrap: { data: { data: [...] } }
    */
   private extractDataArray(resp: unknown): unknown[] | null {
     if (!resp || typeof resp !== "object") return null;
     const obj = resp as Record<string, unknown>;
     const data = obj.data;
     if (Array.isArray(data)) return data;
-    // hey-api double-wrap: { data: { data: [...] } }
-    if (data && typeof data === "object" && "data" in data && Array.isArray((data as Record<string, unknown>).data)) {
-      return (data as Record<string, unknown>).data as unknown[];
+    if (data && typeof data === "object" && "data" in data) {
+      const inner = (data as Record<string, unknown>).data;
+      if (Array.isArray(inner)) return inner;
     }
     return null;
   }
 
   /** Get the default model from /api/model/default. */
-  async getDefaultModel(): Promise<{ providerID: string; modelID: string } | null> {
+  async getDefaultModel(): Promise<ModelRef | null> {
     this.requireClient();
     try {
-      this.debugLog("Fetching default model from /api/model/default");
       const resp = await this.fetchJSON("/model/default", { method: "GET" });
       if (resp && typeof resp === "object") {
         const obj = resp as Record<string, unknown>;
         const providerID = String(obj.providerID ?? "");
         const modelID = String(obj.id ?? obj.modelID ?? "");
-        if (providerID && modelID) {
-          this.debugLog(`Default model: ${providerID}/${modelID}`);
-          return { providerID, modelID };
-        }
+        if (providerID && modelID) return { providerID, modelID };
       }
-      this.debugLog("No default model found");
       return null;
     } catch (err) {
       this.debugLog(`getDefaultModel failed: ${errorMessage(err)}`);
@@ -392,100 +407,62 @@ export class OpencodeBridgeClient {
   }
 
   /** Set the model for a session via POST /api/session/{id}/model. */
-  async setSessionModel(sessionID: string, model: { providerID: string; modelID: string }): Promise<void> {
+  async setSessionModel(sessionID: string, model: ModelRef): Promise<void> {
     this.requireClient();
     try {
-      this.debugLog(`Setting session ${sessionID} model to ${model.providerID}/${model.modelID}`);
       await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/model`, {
         method: "POST",
         body: { id: model.modelID, providerID: model.providerID },
       });
-      this.debugLog(`Session model set`);
+      this.debugLog(`Session model set to ${model.providerID}/${model.modelID}`);
     } catch (err) {
-      this.debugLog(`setSessionModel failed: ${errorMessage(err)}`);
       throw new Error(`Failed to set session model: ${errorMessage(err)}`);
     }
   }
 
   /**
-   * Subscribe to the server's SSE event stream via the SDK's
-   * `client.event.subscribe()`. Calls `onEvent` for every parsed event.
-   * Returns an object with `abort()` to stop dispatching.
+   * Fetch the message history for a session
+   * (`GET /api/session/{id}/message?order=asc`).
    */
-  subscribeToEvents(opts: {
-    onEvent: (event: BridgeEvent) => void;
-    onError?: (error: unknown) => void;
-  }): { abort: () => void } {
-    const client = this.requireClient();
-    let cancelled = false;
-
-    this.debugLog("Subscribing to SSE /api/event");
-
-    void client.event.subscribe({
-      onSseEvent: (raw: { data: unknown; event?: string; id?: string }) => {
-        if (cancelled) return;
-        const event: BridgeEvent = {
-          type: raw.event ?? "unknown",
-          data: raw.data ?? null,
-        };
-        const data = raw.data as Record<string, unknown> | null;
-        if (data && typeof data.sessionID === "string") {
-          event.sessionID = data.sessionID;
-        }
-        this.debugLog(`SSE event: ${event.type}`);
-        opts.onEvent(event);
-      },
-      onSseError: (err: unknown) => {
-        if (cancelled) return;
-        this.debugLog(`SSE error: ${errorMessage(err)}`);
-        opts.onError?.(err);
-      },
-    });
-
-    return {
-      abort: () => {
-        cancelled = true;
-        this.debugLog("SSE subscription aborted");
-      },
-    };
-  }
-
-  /** Fetch the message history for a session (used to restore a chat). */
-  async getMessages(sessionID: string): Promise<Array<{ id: string; role: string; text?: string }>> {
+  async getMessages(sessionID: string): Promise<BridgeMessage[]> {
     this.requireClient();
     try {
       this.debugLog(`Fetching message history for session ${sessionID}`);
-      const cli = this.requireClient();
-      const resp = await cli.session.messages({
-        path: { id: sessionID },
-      });
-      const data = (resp as { data?: unknown })?.data;
-      const messages: Array<{ id: string; role: string; text?: string }> = [];
-      if (data && typeof data === "object" && "data" in data) {
-        const arr = (data as Record<string, unknown>).data as unknown[];
-        if (Array.isArray(arr)) {
-          for (const m of arr) {
-            const obj = m as Record<string, unknown>;
-            const type = String(obj.type ?? "user");
-            let role = "user";
-            let text: string | undefined;
-            if (type === "user") {
-              role = "user";
-              text = obj.text ? String(obj.text) : undefined;
-            } else if (type.startsWith("assistant")) {
-              role = "assistant";
-              const parts = obj.parts as unknown[] | undefined;
-              if (Array.isArray(parts)) {
-                for (const part of parts) {
-                  const p = part as Record<string, unknown>;
-                  if (p.type === "text" && typeof p.text === "string") {
-                    text = p.text;
-                    break;
-                  }
-                }
-              }
-            }
-            messages.push({ id: String(obj.id ?? ""), role, text });
+      const resp = await this.fetchJSON(
+        `/session/${encodeURIComponent(sessionID)}/message?order=asc`,
+        { method: "GET" }
+      );
+      const arr = this.extractDataArray(resp);
+      const messages: BridgeMessage[] = [];
+      if (!Array.isArray(arr)) return messages;
+
+      for (const item of arr) {
+        const obj = item as Record<string, unknown>;
+        const type = String(obj.type ?? "");
+        const created =
+          obj.time && typeof obj.time === "object"
+            ? Number((obj.time as Record<string, unknown>).created ?? 0) || undefined
+            : undefined;
+
+        if (type === "user") {
+          messages.push({ id: String(obj.id ?? ""), role: "user", text: String(obj.text ?? ""), created });
+          continue;
+        }
+
+        if (type === "assistant") {
+          const parts = Array.isArray(obj.content) ? obj.content : [];
+          const texts: string[] = [];
+          for (const part of parts) {
+            const p = part as Record<string, unknown>;
+            if (p.type === "text" && typeof p.text === "string" && p.text) texts.push(p.text);
+          }
+          if (texts.length > 0) {
+            messages.push({
+              id: String(obj.id ?? ""),
+              role: "assistant",
+              text: texts.join("\n\n"),
+              created,
+            });
           }
         }
       }
@@ -493,41 +470,67 @@ export class OpencodeBridgeClient {
       return messages;
     } catch (err) {
       this.debugLog(`getMessages failed: ${errorMessage(err)}`);
-      console.warn(`[opencode-bridge] failed to load messages: ${errorMessage(err)}`);
-      return [];
+      throw new Error(`Failed to load message history: ${errorMessage(err)}`);
     }
   }
 
-  /** Extract an incremental text delta from a `session.text.delta` event. */
-  static extractTextDelta(event: BridgeEvent): StreamPart | null {
-    if (event.type !== "session.text.delta") return null;
-    const data = event.data as Record<string, unknown> | null;
-    if (!data) return null;
-    const assistantMessageID =
-      typeof data.assistantMessageID === "string"
-        ? data.assistantMessageID
-        : typeof data.messageID === "string"
-          ? data.messageID
-          : "";
-    const sessionID = event.sessionID || (typeof data.sessionID === "string" ? data.sessionID : "");
-    const text = typeof data.text === "string" ? data.text : "";
-    if (!assistantMessageID || !text) return null;
-    return { messageID: assistantMessageID, sessionID, text };
+  /**
+   * Open ONE SSE connection to `/api/event` and dispatch parsed events until
+   * the stream ends or the signal aborts. Reconnection is the caller's job
+   * (see ChatController), which keeps exactly one subscription alive.
+   *
+   * Returns when the stream ends. Throws on HTTP/network errors (AbortError
+   * when aborted by the caller).
+   */
+  async streamEvents(opts: {
+    signal: AbortSignal;
+    onEvent: (event: BridgeEvent) => void;
+  }): Promise<void> {
+    this.requireClient();
+    const headers: Record<string, string> = { Accept: "text/event-stream" };
+    if (this.authHeader) headers.Authorization = this.authHeader;
+
+    this.debugLog("Opening SSE /api/event");
+    const res = await fetch(`${this.baseUrl}/event`, {
+      method: "GET",
+      headers,
+      signal: opts.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`SSE HTTP ${res.status}: ${snippet(text) || res.statusText}`);
+    }
+    if (!res.body) throw new Error("SSE response has no body");
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const event = parseSseBlock(block);
+          if (event) opts.onEvent(event);
+          boundary = buffer.indexOf("\n\n");
+        }
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        /* ignore */
+      }
+      this.debugLog("SSE /api/event closed");
+    }
   }
 
   /** Test-only: replace the underlying SDK client (for mocking). */
   setClientForTesting(client: OpencodeClient): void {
     this.client = client;
-  }
-}
-
-/** Turn an unknown error into a user-friendly string. */
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
   }
 }

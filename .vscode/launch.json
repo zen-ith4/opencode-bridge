@@ -5,9 +5,14 @@
       "name": "OpenCode Bridge: Launch Extension",
       "type": "extensionHost",
       "request": "launch",
-      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
-      "outFiles": ["${workspaceFolder}/out/**/*.js"],
-      "preLaunchTask": "OpenCode Bridge: compile",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/out/**/*.js",
+        "${workspaceFolder}/out/**/*.cjs"
+      ],
+      "preLaunchTask": "OpenCode Bridge: bundle",
       "sourceMaps": true
     }
   ]

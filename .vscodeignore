@@ -1,0 +1,20 @@
+# Sources are compiled into the esbuild bundle (out/extension.js).
+src/**
+test/**
+tsconfig*.json
+.eslintrc.json
+.vscode/**
+.gitignore
+.git/**
+*.vsix
+opencode-bridge-*.vsix
+package-lock.json
+
+# The bundle is self-contained; no runtime node_modules are needed.
+node_modules/**
+
+# Development-only artifacts.
+out/**/*.map
+test-build/**
+**/*.ts
+**/*.tsbuildinfo

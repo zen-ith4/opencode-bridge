@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "test-build",
+    "rootDir": "src",
+    "noEmit": false,
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": [
+    "src/log.ts",
+    "src/events.ts",
+    "src/client.ts",
+    "src/managedServer.ts",
+    "src/chatController.ts"
+  ],
+  "exclude": ["node_modules", "out", "test-build", "media"]
+}

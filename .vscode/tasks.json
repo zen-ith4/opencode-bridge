@@ -2,14 +2,20 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "OpenCode Bridge: compile",
-      "type": "typescript",
-      "tsconfig": "tsconfig.json",
+      "label": "OpenCode Bridge: bundle",
+      "type": "shell",
+      "command": "npm run package",
       "problemMatcher": ["$tsc"],
       "group": {
         "kind": "build",
         "isDefault": true
       }
+    },
+    {
+      "label": "OpenCode Bridge: typecheck",
+      "type": "shell",
+      "command": "npm run typecheck",
+      "problemMatcher": ["$tsc"]
     }
   ]
 }
