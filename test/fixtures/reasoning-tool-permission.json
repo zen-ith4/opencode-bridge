@@ -1,0 +1,215 @@
+[
+  {
+    "id": "evt_fixture_0001",
+    "created": 1795319998000,
+    "type": "session.execution.started",
+    "data": { "sessionID": "ses_fixture" }
+  },
+  {
+    "id": "evt_fixture_0002",
+    "created": 1795319998100,
+    "type": "session.step.started",
+    "data": {
+      "sessionID": "ses_fixture",
+      "agent": "build",
+      "model": { "id": "tidepool-alpha-free", "providerID": "opencode", "variant": "medium" },
+      "assistantMessageID": "msg_fixture_assistant",
+      "started": 1795319998100
+    }
+  },
+  {
+    "id": "evt_fixture_0003",
+    "created": 1795319998200,
+    "type": "session.reasoning.started",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant",
+      "ordinal": 0,
+      "native": { "reasoningField": "reasoning_content" }
+    }
+  },
+  {
+    "id": "evt_fixture_0004",
+    "created": 1795319998300,
+    "type": "session.reasoning.delta",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant",
+      "ordinal": 0,
+      "delta": "The user wants me to read a file."
+    }
+  },
+  {
+    "id": "evt_fixture_0005",
+    "created": 1795319998400,
+    "type": "session.reasoning.delta",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant",
+      "ordinal": 0,
+      "delta": " I should use the read tool."
+    }
+  },
+  {
+    "id": "evt_fixture_0006",
+    "created": 1795319998500,
+    "type": "session.reasoning.ended",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant",
+      "ordinal": 0,
+      "text": "The user wants me to read a file. I should use the read tool.",
+      "native": { "reasoningField": "reasoning_content" }
+    }
+  },
+  {
+    "id": "evt_fixture_0007",
+    "created": 1795319998600,
+    "type": "session.tool.input.started",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant",
+      "id": "call_fixture_read",
+      "name": "read"
+    }
+  },
+  {
+    "id": "evt_fixture_0008",
+    "created": 1795319998650,
+    "type": "session.tool.input.ended",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant",
+      "id": "call_fixture_read",
+      "text": "{\"path\": \".env\"}"
+    }
+  },
+  {
+    "id": "evt_fixture_0009",
+    "created": 1795319998700,
+    "type": "session.tool.called",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant",
+      "id": "call_fixture_read",
+      "input": { "path": ".env" },
+      "executed": false
+    }
+  },
+  {
+    "id": "evt_fixture_0010",
+    "created": 1795319999106,
+    "type": "permission.asked",
+    "data": {
+      "id": "per_fixture_read",
+      "sessionID": "ses_fixture",
+      "action": "read",
+      "resources": [".env"],
+      "save": ["*"],
+      "source": {
+        "type": "tool",
+        "messageID": "msg_fixture_assistant",
+        "id": "call_fixture_read"
+      }
+    }
+  },
+  {
+    "id": "evt_fixture_0011",
+    "created": 1795319999300,
+    "type": "permission.replied",
+    "data": {
+      "sessionID": "ses_fixture",
+      "requestID": "per_fixture_read",
+      "reply": "once"
+    }
+  },
+  {
+    "id": "evt_fixture_0012",
+    "created": 1795319999600,
+    "type": "session.tool.success",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant",
+      "id": "call_fixture_read",
+      "content": [{ "type": "text", "text": "SECRET=topsecret" }],
+      "metadata": { "truncated": false },
+      "executed": false
+    }
+  },
+  {
+    "id": "evt_fixture_0013",
+    "created": 1795319999700,
+    "type": "session.step.ended",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant",
+      "finish": "tool-calls",
+      "rawFinish": "tool_calls",
+      "tokens": { "input": 15688, "output": 45, "reasoning": 53, "cache": { "read": 8, "write": 0 } },
+      "cost": 0
+    }
+  },
+  {
+    "id": "evt_fixture_0014",
+    "created": 1795319999800,
+    "type": "session.step.started",
+    "data": {
+      "sessionID": "ses_fixture",
+      "agent": "build",
+      "model": { "id": "tidepool-alpha-free", "providerID": "opencode", "variant": "medium" },
+      "assistantMessageID": "msg_fixture_assistant_2",
+      "started": 1795319999800
+    }
+  },
+  {
+    "id": "evt_fixture_0015",
+    "created": 1795319999900,
+    "type": "session.text.started",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant_2",
+      "ordinal": 0
+    }
+  },
+  {
+    "id": "evt_fixture_0016",
+    "created": 1795320000000,
+    "type": "session.text.delta",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant_2",
+      "ordinal": 0,
+      "delta": "The .env file contains SECRET=topsecret."
+    }
+  },
+  {
+    "id": "evt_fixture_0017",
+    "created": 1795320000100,
+    "type": "session.text.ended",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant_2",
+      "ordinal": 0,
+      "text": "The .env file contains SECRET=topsecret."
+    }
+  },
+  {
+    "id": "evt_fixture_0018",
+    "created": 1795320000200,
+    "type": "session.step.ended",
+    "data": {
+      "sessionID": "ses_fixture",
+      "assistantMessageID": "msg_fixture_assistant_2",
+      "finish": "stop",
+      "rawFinish": "stop",
+      "tokens": { "input": 108, "output": 36, "reasoning": 102, "cache": { "read": 15792, "write": 0 } },
+      "cost": 0
+    }
+  },
+  {
+    "id": "evt_fixture_0019",
+    "created": 1795320000300,
+    "type": "session.execution.succeeded",
+    "data": { "sessionID": "ses_fixture" }
+  }
+]

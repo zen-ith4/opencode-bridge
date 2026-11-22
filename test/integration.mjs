@@ -154,6 +154,39 @@ try {
   }
 
   /* ------------------------------------------------------------------ */
+  /* Verified v2.3.0 structural endpoints                               */
+  /* ------------------------------------------------------------------ */
+
+  const agents = await client.getAgents(process.cwd());
+  const commands = await client.getCommands(process.cwd());
+  const skills = await client.getSkills(process.cwd());
+  const listedSessions = await client.listSessions({
+    limit: 5,
+    order: "desc",
+    directory: process.cwd(),
+  });
+  const activeSessions = await client.getActiveSessions();
+  const primaryAgents = agents.filter(
+    (agent) => !agent.hidden && (agent.mode === "primary" || agent.mode === "all")
+  );
+  console.log(
+    `structure: agents=${agents.length} (primary=${primaryAgents.length}) ` +
+      `commands=${commands.length} skills=${skills.length} ` +
+      `sessions=${listedSessions.sessions.length} active=${activeSessions.length}`
+  );
+  console.log(
+    `agents: ${agents.map((agent) => `${agent.id}:${agent.mode}${agent.hidden ? ":hidden" : ""}`).join(", ") || "none"}`
+  );
+  if (!Array.isArray(agents)) fail("GET /api/agent did not return an array");
+  if (!Array.isArray(commands)) fail("GET /api/command did not return an array");
+  if (!Array.isArray(skills)) fail("GET /api/skill did not return an array");
+  if (!Array.isArray(listedSessions.sessions)) fail("GET /api/session did not return a session list");
+  if (!Array.isArray(activeSessions)) fail("GET /api/session/active did not return a list");
+  if (agents.length > 0 && primaryAgents.length === 0) {
+    fail("GET /api/agent returned no primary non-hidden agents");
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Controller with subscription tracking                              */
   /* ------------------------------------------------------------------ */
 
@@ -221,6 +254,24 @@ try {
   console.log(`SSE event types (${rawEvents.length} total): ${types.join(", ")}`);
 
   const sessionID = controller.getSessionID();
+  if (sessionID) {
+    const detail = await client.getSession(sessionID);
+    const pendingPermissions = await client.getPermissions(sessionID);
+    const pendingForms = await client.getForms(sessionID);
+    const diff = await client.getDiff(sessionID);
+    const refreshed = await client.listSessions({ limit: 30, order: "desc", directory: process.cwd() });
+    console.log(
+      `session: detail=${detail ? "ok" : "missing"} ` +
+        `permissions=${pendingPermissions.length} forms=${pendingForms.length} diff=${diff.length}`
+    );
+    if (!detail) fail(`GET /api/session/${sessionID} returned no data`);
+    if (!Array.isArray(pendingPermissions)) fail("GET /api/session/{id}/permission did not return a list");
+    if (!Array.isArray(pendingForms)) fail("GET /api/session/{id}/form did not return a list");
+    if (!Array.isArray(diff)) fail("GET /api/session/{id}/diff did not return a list");
+    if (!refreshed.sessions.some((session) => session.id === sessionID)) {
+      fail("the created session is missing from GET /api/session");
+    }
+  }
   const deltaEvents = rawEvents.filter(
     (event) => event.type === "session.text.delta" && event.sessionID === sessionID
   );

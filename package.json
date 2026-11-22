@@ -154,6 +154,15 @@
           ],
           "default": "managed",
           "description": "Server connection mode. 'managed' (default) starts a private opencode serve instance with a random password. 'external' connects to an existing server at hostname:port."
+        },
+        "opencodeBridge.permissions": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "readOnlyAuto"
+          ],
+          "default": "ask",
+          "description": "How tool permission requests are handled. 'ask' (default) shows an Allow once / Allow always / Reject card for every request. 'readOnlyAuto' automatically answers read-only requests with 'once'; edits, writes, and shell commands are still always shown. 'always' is never chosen automatically."
         }
       }
     }

@@ -32,6 +32,7 @@ export interface ChatViewOptions {
   workspaceDir?: string;
   mode?: "managed" | "external";
   getResponseTimeoutSeconds?: () => number;
+  getPermissionsMode?: () => "ask" | "readOnlyAuto";
   persistModel?: (model: ModelRef | null) => void;
   persistSession?: (sessionID: string) => void;
   onSetPassword?: () => Promise<void>;
@@ -43,12 +44,16 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
   public static readonly viewType = "opencode-bridge.chat";
 
   private readonly controller: ChatController;
+  private readonly client: OpencodeBridgeClient;
   private readonly extensionPath: string;
+  private readonly workspaceDir?: string;
   private _view?: vscode.WebviewView;
   private viewDisposables: vscode.Disposable[] = [];
 
   constructor(options: ChatViewOptions) {
     this.extensionPath = options.extensionPath;
+    this.client = options.client;
+    this.workspaceDir = options.workspaceDir;
     this.controller = new ChatController({
       client: options.client,
       post: (message) => this.postToWebview(message),
@@ -58,8 +63,10 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       debug: options.debug ?? false,
       sessionID: options.sessionID,
       getResponseTimeoutSeconds: options.getResponseTimeoutSeconds,
+      getPermissionsMode: options.getPermissionsMode,
       persistModel: options.persistModel,
       persistSession: options.persistSession,
+      onOpenFile: (file) => void this.openFile(file),
       onSetPassword: options.onSetPassword,
       onEnterPassword: options.onEnterPassword,
       onOpenLogs: options.onOpenLogs,
@@ -124,7 +131,75 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (message.type === "openFile") {
+      await this.openFile(String(message.path ?? ""));
+      return;
+    }
+
+    if (message.type === "openDiff") {
+      await this.openDiff(
+        String(message.path ?? ""),
+        typeof message.from === "string" ? message.from : undefined
+      );
+      return;
+    }
+
     await this.controller.handleMessage(message);
+  }
+
+  /** Resolve a workspace-relative path and open it in the editor. */
+  private async openFile(filePath: string): Promise<void> {
+    if (!filePath) return;
+    try {
+      const uri = this.resolveUri(filePath);
+      if (!uri) return;
+      const document = await vscode.workspace.openTextDocument(uri);
+      await vscode.window.showTextDocument(document, { preview: true });
+    } catch (err) {
+      logError(`Failed to open file ${filePath}: ${errMessage(err)}`);
+      void vscode.window.showWarningMessage(`OpenCode Bridge: could not open ${filePath}`);
+    }
+  }
+
+  /**
+   * Show the server's unified patch for a file in a diff-language editor.
+   * The v2.3.0 spec has no endpoint for snapshot file contents, so a true
+   * side-by-side vscode.diff is not possible; the patch endpoint is verified.
+   */
+  private async openDiff(filePath: string, from?: string): Promise<void> {
+    const sessionID = this.controller.getSessionID();
+    if (!sessionID) {
+      await this.openFile(filePath);
+      return;
+    }
+    try {
+      const diffs = await this.client.getDiff(sessionID, from);
+      const match =
+        diffs.find((d) => d.file === filePath || d.file.endsWith(`/${filePath}`)) ?? diffs[0];
+      if (!match) {
+        await this.openFile(filePath);
+        return;
+      }
+      const header = `# ${match.file} (${match.status}, +${match.additions} -${match.deletions})\n\n`;
+      const document = await vscode.workspace.openTextDocument({
+        content: header + match.patch,
+        language: "diff",
+      });
+      await vscode.window.showTextDocument(document, { preview: true });
+    } catch (err) {
+      logError(`Failed to show diff for ${filePath}: ${errMessage(err)}`);
+      await this.openFile(filePath);
+    }
+  }
+
+  private resolveUri(filePath: string): vscode.Uri | undefined {
+    if (/^[a-zA-Z]+:\/\//.test(filePath)) return vscode.Uri.parse(filePath);
+    if (filePath.startsWith("/")) return vscode.Uri.file(filePath);
+    const base =
+      this.workspaceDir ??
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!base) return undefined;
+    return vscode.Uri.file(path.join(base, filePath));
   }
 
   /* ------------------------------------------------------------------ */
@@ -204,6 +279,9 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
     const markdownUri = webview.asWebviewUri(
       vscode.Uri.file(path.join(this.extensionPath, "media", "markdown.cjs"))
     );
+    const slashUri = webview.asWebviewUri(
+      vscode.Uri.file(path.join(this.extensionPath, "media", "slash.cjs"))
+    );
     const cssUri = webview.asWebviewUri(
       vscode.Uri.file(path.join(this.extensionPath, "media", "webview.css"))
     );
@@ -234,8 +312,20 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
         <span class="brand-name">OpenCode</span>
       </div>
       <div class="header-actions">
+        <button type="button" id="agentButton" class="model-button compact" aria-haspopup="listbox" aria-expanded="false" title="Choose agent">
+          <span id="agentLabel">Agent</span>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
+        <button type="button" id="sessionButton" class="model-button compact" aria-haspopup="dialog" aria-expanded="false" title="Switch session">
+          <span id="sessionLabel">Sessions</span>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
         <button type="button" id="modelButton" class="model-button" aria-haspopup="listbox" aria-expanded="false" title="Choose model">
           <span id="modelLabel">Default model</span>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
+        <button type="button" id="variantButton" class="model-button compact" aria-haspopup="listbox" aria-expanded="false" title="Thinking effort variant" hidden>
+          <span id="variantLabel">Variant</span>
           <span class="chevron" aria-hidden="true">▾</span>
         </button>
         <button type="button" id="btnRefresh" class="icon-btn" aria-label="Refresh models" title="Refresh models">↻</button>
@@ -246,6 +336,20 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       <div id="modelPopover" class="popover" role="dialog" aria-label="Select a model" hidden>
         <input id="modelSearch" type="search" placeholder="Search models" aria-label="Search models" autocomplete="off" />
         <div id="modelList" class="model-list" role="listbox" aria-label="Models"></div>
+      </div>
+      <div id="agentPopover" class="popover" role="dialog" aria-label="Select an agent" hidden>
+        <div id="agentList" class="model-list" role="listbox" aria-label="Agents"></div>
+      </div>
+      <div id="variantPopover" class="popover" role="dialog" aria-label="Select thinking effort" hidden>
+        <div id="variantList" class="model-list" role="listbox" aria-label="Variants"></div>
+      </div>
+      <div id="sessionPanel" class="popover session-panel" role="dialog" aria-label="Sessions" hidden>
+        <input id="sessionSearch" type="search" placeholder="Search sessions" aria-label="Search sessions" autocomplete="off" />
+        <div id="sessionList" class="session-list" role="listbox" aria-label="Sessions"></div>
+        <div class="session-actions">
+          <button type="button" id="sessionMore" class="banner-btn">Load more</button>
+          <button type="button" id="sessionNew" class="banner-btn primary">New chat</button>
+        </div>
       </div>
     </header>
 
@@ -285,16 +389,33 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
       <button type="button" id="btnCancelWait" class="link-btn" hidden>Cancel</button>
     </div>
 
+    <div id="contextBar" class="context-bar" hidden>
+      <progress id="contextProgress" max="100" value="0" aria-label="Context window usage"></progress>
+      <span id="contextText" class="context-text">0 / 0</span>
+      <button type="button" id="btnCompact" class="link-btn" title="Compact the conversation">Compact</button>
+    </div>
+    <div id="compaction" class="compaction" role="status" aria-live="polite" hidden>
+      <span class="spinner" aria-hidden="true">◌</span>
+      <span id="compactionText">Compacting…</span>
+    </div>
+
+    <div id="slashPalette" class="slash-palette" role="listbox" aria-label="Commands" hidden></div>
+
     <form id="composer" class="composer">
-      <textarea id="input" rows="1" dir="auto" placeholder="Ask OpenCode…  (Enter to send, Shift+Enter for newline)" aria-label="Message OpenCode"></textarea>
+      <textarea id="input" rows="1" dir="auto" placeholder="Ask OpenCode…  (Enter to send, Shift+Enter for newline, / for commands)" aria-label="Message OpenCode"></textarea>
       <button type="submit" id="btnSend" class="send-btn" aria-label="Send message">Send</button>
     </form>
   </div>
   <script src="${markdownUri}" nonce="${nonce}"></script>
+  <script src="${slashUri}" nonce="${nonce}"></script>
   <script src="${jsUri}" nonce="${nonce}"></script>
 </body>
 </html>`;
   }
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /** Cryptographically-random nonce for CSP. */

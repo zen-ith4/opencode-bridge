@@ -326,8 +326,31 @@ export class ManagedServer {
     }
 
     // The password must actually be enforced: with auth => 200, without => 401.
-    const authed = await probeServer(baseUrl, authHeader);
-    if (authed.reachable && (authed.statusCode === 401 || authed.statusCode === 403)) {
+    // A server that is listening but still initializing answers 5xx, so keep
+    // polling briefly instead of accepting a half-started server.
+    const probeDeadline = Date.now() + SERVER_READY_TIMEOUT_MS;
+    let authed = await probeServer(baseUrl, authHeader);
+    while (
+      Date.now() < probeDeadline &&
+      authed.reachable &&
+      typeof authed.statusCode === "number" &&
+      authed.statusCode >= 500
+    ) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      authed = await probeServer(baseUrl, authHeader);
+    }
+    if (!authed.reachable || (authed.statusCode ?? 0) >= 500) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      throw new Error(
+        `OpenCode server (managed mode) did not become ready on ${baseUrl} ` +
+          `(HTTP ${authed.statusCode ?? "unreachable"}). See the "OpenCode Bridge" output channel.`
+      );
+    }
+    if (authed.statusCode === 401 || authed.statusCode === 403) {
       try {
         child.kill("SIGTERM");
       } catch {

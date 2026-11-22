@@ -49,10 +49,12 @@ interface Settings {
   serverMode: ServerMode;
   debug: boolean;
   responseTimeoutSeconds: number;
+  permissions: "ask" | "readOnlyAuto";
 }
 
 function getSettings(): Settings {
   const cfg = vscode.workspace.getConfiguration("opencodeBridge");
+  const permissions = cfg.get<string>("permissions", "ask");
   return {
     port: cfg.get<number>("port", 4096),
     hostname: cfg.get<string>("hostname", "127.0.0.1"),
@@ -62,6 +64,7 @@ function getSettings(): Settings {
     serverMode: cfg.get<string>("serverMode", "managed") as ServerMode,
     debug: cfg.get<boolean>("debug", false),
     responseTimeoutSeconds: cfg.get<number>("responseTimeoutSeconds", 120),
+    permissions: permissions === "readOnlyAuto" ? "readOnlyAuto" : "ask",
   };
 }
 
@@ -180,7 +183,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   const modelFromSetting = settings.model ? parseModelString(settings.model) : null;
   const selectedModel = persistedModel ?? modelFromSetting;
-  const savedSession = context.globalState.get<string | undefined>(CURRENT_SESSION_KEY, undefined);
+  // Last session is persisted per workspace (workspaceState), as requested.
+  const savedSession = context.workspaceState.get<string | undefined>(CURRENT_SESSION_KEY, undefined);
 
   chatView = new OpenCodeChatView({
     client,
@@ -191,11 +195,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     workspaceDir: firstWorkspaceFolder(),
     mode: currentMode,
     getResponseTimeoutSeconds: () => getSettings().responseTimeoutSeconds,
+    getPermissionsMode: () => getSettings().permissions,
     persistModel: (model) => {
       void context.globalState.update(SELECTED_MODEL_KEY, model);
     },
     persistSession: (sessionID) => {
-      void context.globalState.update(CURRENT_SESSION_KEY, sessionID);
+      void context.workspaceState.update(CURRENT_SESSION_KEY, sessionID);
     },
     onSetPassword: () => promptAndApplyPassword(context),
     onEnterPassword: () => promptAndApplyPassword(context),

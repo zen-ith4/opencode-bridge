@@ -52,6 +52,59 @@ key configuration. Model inference stays inside that server.
   (Retry, Enter password, Open logs, Cancel). Inline bubbles are only used for
   failed prompts.
 
+### Thinking, tools, permissions and questions
+
+- **Reasoning / thinking blocks.** `session.reasoning.*` streams into a
+  collapsible block above the answer with a live elapsed timer. It collapses
+  automatically when the answer text starts, and is restored from history
+  (`content[].type === "reasoning"`).
+- **Tool cards.** `session.tool.*` renders one card per call with a kind icon
+  (read / edit / write / bash / search / web / subagent / todo), a title
+  derived from the input (`path`, `command`, `pattern`, …), a
+  pending/running/done/failed badge and a collapsible body. The body shows the
+  input, output content and error. File paths open in the editor; the Diff
+  button opens the session's unified patch. A **Files changed** summary is
+  appended at the end of the turn, merging `step.ended.files` with paths from
+  write/edit inputs.
+- **Permissions.** `permission.asked` shows an Allow once / Allow always /
+  Reject card. Replies use the verified enum `"once" | "always" | "reject"`.
+  Pending requests are fetched again on reconnect
+  (`GET /api/session/{id}/permission`). With
+  `opencodeBridge.permissions = "readOnlyAuto"` only read-only actions
+  (`read`, `grep`, `glob`, `list`, `search`, `find`, `webfetch`, `websearch`)
+  are auto-answered with `"once"`; edits, writes and shell commands always
+  ask, and `"always"` is never chosen automatically.
+- **Questions.** In v2.3.0 a question is a form (`form.created`,
+  `GET /api/session/{id}/form`). The webview renders its fields (string with
+  options, multiselect, boolean, number/integer, custom "Other…") and replies
+  with `{ answer }` to `POST /form/{formID}/reply`.
+- **Agents.** A header dropdown lists primary, non-hidden agents from
+  `GET /api/agent`. The choice is applied with
+  `POST /api/session/{id}/agent`, passed when creating a session, and kept in
+  sync with `session.agent.selected`. `Shift+Tab` and `Ctrl+.` cycle agents.
+- **Slash palette.** Typing `/` opens a keyboard-filterable palette. Built-ins
+  are `/new`, `/sessions`, `/models`, `/compact`, `/undo`, `/redo`, `/agent`
+  and `/clear`. Custom commands from `GET /api/command` run through
+  `POST /api/session/{id}/command {name,text}` (verified: the template is
+  expanded into a user message). Skills from `GET /api/skill` are not
+  first-class commands in v2.3.0, so selecting one inserts a prompt that names
+  the skill.
+- **Sessions.** A searchable picker lists `GET /api/session` newest first with
+  cursor pagination, title, relative time and directory, and marks running
+  sessions. Switching loads the full history, agent and model. **New chat**
+  returns to an empty view, and the last session is stored per workspace in
+  `workspaceState`.
+- **Context meter.** Shows `used / limit` and a percentage from the selected
+  model's `limit.context`, using the latest `step.ended.tokens` as
+  `input + cache.read` (the server's cumulative `session.tokens` is not used).
+  The bar turns yellow above 70% and red above 90%; the tooltip shows the
+  token breakdown and cost. **Compact** calls
+  `POST /api/session/{id}/compact` and shows compaction progress from
+  `session.compaction.*`.
+- **Model variants.** When a model exposes `variants[]`, a selector applies
+  the chosen reasoning effort through the verified
+  `Model.Ref = { id, providerID, variant? }` field.
+
 ### Diagnostics
 
 - Every error is written to the **OpenCode Bridge** Output channel
@@ -92,7 +145,7 @@ key configuration. Model inference stays inside that server.
 npm install
 npm run typecheck    # tsc --noEmit (includes the esbuild entry)
 npm run lint
-npm test             # markdown / events / controller / managed-server tests
+npm test             # markdown / slash / events / controller / managed-server tests
 ```
 
 Press **F5**. The preLaunch task `OpenCode Bridge: bundle` runs
@@ -120,6 +173,9 @@ The script starts a real managed server with a random password and checks:
 
 - the generated password is enforced,
 - `GET /api/provider` and `GET /api/model` match `opencode models`,
+- `GET /api/agent`, `/command`, `/skill`, `/session`, `/session/active`,
+  `/session/{id}`, `/session/{id}/permission`, `/form` and `/diff` respond
+  with the expected shapes,
 - the ready handshake opens exactly one SSE subscription,
 - a prompt is accepted and SSE events are parsed,
 - event ids are applied at most once and streamed text is not duplicated.
@@ -138,7 +194,8 @@ result and says that no reply was received.
   "opencodeBridge.opencodePath": "opencode",
   "opencodeBridge.model": "",
   "opencodeBridge.responseTimeoutSeconds": 120,
-  "opencodeBridge.debug": false
+  "opencodeBridge.debug": false,
+  "opencodeBridge.permissions": "ask"
 }
 ```
 
@@ -151,6 +208,7 @@ result and says that no reply was received.
 | `model` | `""` | Optional `providerID/modelID`; empty uses the server default. |
 | `responseTimeoutSeconds` | `120` | Quiet time before a non-blocking "Still waiting" status with Cancel. Reset by any event for the current session. |
 | `debug` | `false` | Verbose lines in the Output channel. |
+| `permissions` | `"ask"` | `"ask"` shows a card for every permission request. `"readOnlyAuto"` auto-replies `"once"` to read-only requests only. |
 
 ## Password handling
 
@@ -179,6 +237,64 @@ secret key `opencodeBridge.serverPassword`.
 | `OpenCode: Set Server Password` | — | command palette / 🔑 |
 | `OpenCode: Clear Server Password` | — | command palette |
 | `OpenCode: Show Logs` | — | command palette |
+
+## Verified against OpenCode v2.3.0
+
+Every endpoint and event below was checked against a live `opencode serve`
+v2.3.0 and its `/openapi.json` (fetched with Basic auth):
+
+- SSE payloads are `data: {"id","created","type","data"}` with **no** `event:`
+  line; text and reasoning chunks are in `data.delta`. v1.19.6
+  `session.next.*` aliases are normalized, so newer servers keep working.
+- Canonical events used: `session.reasoning.*`, `session.tool.*`,
+  `session.step.*`, `permission.asked/replied`, `form.created/replied/cancelled`,
+  `session.agent.selected`, `session.model.selected`, `session.status`,
+  `session.idle`, `session.execution.*` and `session.compaction.*`.
+- `Permission.Reply` is `["once","always","reject"]`; the body is
+  `{decision, message?}`; pending requests come from
+  `GET /api/session/{id}/permission`.
+- Questions are forms, not a `/question` route. Pending forms come from
+  `GET /api/session/{id}/form`, and the reply body is `{answer}`.
+- `session.prompt` has no model field. Switching model is
+  `POST /api/session/{id}/model {model:{id,providerID,variant?}}`; session
+  creation accepts `agent` and `model`.
+- Custom commands work via `POST /api/session/{id}/command {name,text}`
+  (HTTP 204; the template becomes a user message). Skills are not commands.
+- `session.tool.success` has no reliable `outputPaths`; write/edit paths come
+  from `input.path`, and `step.ended.files` can add more.
+- There is no snapshot file-content endpoint. **Diff** opens the verified
+  `/session/{id}/diff` unified patch in an untitled `diff` editor; clicking a
+  file opens the file itself.
+- There is no redo endpoint. **Redo** re-sends the last undone prompt;
+  **Undo** stages and commits a revert of the last user message.
+
+## Manual test steps
+
+The automated tests cover the event reducer, slash filtering, context math and
+the live structural endpoints. These UI behaviours still need a human:
+
+1. **Thinking.** Send a prompt to a reasoning model. A block appears above the
+   answer, streams, shows an elapsed timer and collapses when text starts.
+   Reload the view: the reasoning is restored and collapsed.
+2. **Tools.** Ask the agent to read a file. The card shows the file title, a
+   running badge and expanded content; click the path to open the file, then
+   **Files changed** lists it at the end.
+3. **Permission.** Ask the agent to edit a file with `permissions = "ask"`.
+   The card offers Allow once / Allow always / Reject; each completes the
+   tool and removes the card. Switch to `readOnlyAuto` and confirm a read is
+   auto-approved while an edit still asks.
+4. **Question.** Trigger a question form and submit text, a select, a
+   multiselect and a boolean; the card disappears after Submit.
+5. **Agents.** Open the header agent dropdown, switch agents, and press
+   `Shift+Tab` / `Ctrl+.`. The selection survives a view reload.
+6. **Sessions.** Use `/sessions` to search, switch to an older session and
+   confirm its full history, then **New chat**. Reload VS Code: the last
+   session is restored for that workspace.
+7. **Slash palette.** Type `/` and filter with each built-in, a custom command
+   and a skill. `Enter`/`Tab` chooses, arrows move, `Escape` closes.
+8. **Context meter and variants.** Check `used / limit`, tooltip breakdown and
+   the yellow/red thresholds; run **Compact** and watch progress. If the model
+   has variants, switch one and confirm the next step reports that variant.
 
 ## Error handling
 
@@ -218,8 +334,12 @@ secret key `opencodeBridge.serverPassword`.
 - `src/client.ts` uses raw `fetch` for the endpoints that differ from the
   bundled SDK version, including the SSE stream, and parses
   `type = payload.type ?? sse.event` with text in `data.delta`.
-- `media/markdown.cjs` is shared by the webview (`window.OcMarkdown`) and the
-  Node unit tests.
+- `media/markdown.cjs` and `media/slash.cjs` are shared by the webview
+  (`OcMarkdown`, `OcSlash`) and the Node unit tests.
+- `test/fixtures/reasoning-tool-permission.json` is a recorded v2.3.0 event
+  sequence (reasoning → tool → permission → final text) used by the reducer
+  tests; `test/slash.test.mjs` covers palette filtering and
+  `test/chatController.test.mjs` covers context math.
 - `npm run compile` only type-checks; the runtime artifact is the esbuild
   bundle in `out/extension.cjs`.
 

@@ -37,7 +37,10 @@ export interface BridgeSession {
   id: string;
   title: string;
   directory?: string;
-  model?: { providerID: string; modelID: string } | null;
+  model?: ModelRef | null;
+  agent?: string;
+  updated?: number;
+  created?: number;
 }
 
 /** A provider returned by /api/provider. */
@@ -47,26 +50,186 @@ export interface BridgeProvider {
   activation: string;
 }
 
-/** A model returned by /api/model. */
+/** One reasoning-effort / thinking variant of a model (`Model.Variant`). */
+export interface ModelVariant {
+  id: string;
+  settings?: Record<string, unknown>;
+}
+
+export interface ModelCost {
+  input: number;
+  output: number;
+  cache?: { read: number; write: number };
+}
+
+/** A model returned by /api/model (verified v2.3.0 `Model.Info`). */
 export interface BridgeModel {
   id: string;
   modelID: string;
   providerID: string;
   type: string;
   name: string;
+  /** Context/output limits. */
+  limit?: { context: number; input?: number; output: number };
+  /** Reasoning variants (empty or absent when the model has none). */
+  variants?: ModelVariant[];
+  /** Cost per million tokens. */
+  cost?: ModelCost[];
 }
 
-/** A message restored from GET /api/session/{id}/message. */
+export interface TokenUsage {
+  input: number;
+  output: number;
+  reasoning: number;
+  cache: { read: number; write: number };
+}
+
+export interface ToolContent {
+  type: string;
+  text?: string;
+  [key: string]: unknown;
+}
+
+/** A tool call restored from history (`Session.Message.Assistant.Tool`). */
+export interface MessageToolPart {
+  type: "tool";
+  id: string;
+  name: string;
+  status: "streaming" | "running" | "completed" | "error";
+  input: Record<string, unknown> | string;
+  content?: ToolContent[];
+  metadata?: Record<string, unknown>;
+  error?: string;
+  executed?: boolean;
+  created?: number;
+  completed?: number;
+}
+
+export interface MessageReasoningPart {
+  type: "reasoning";
+  text: string;
+  created?: number;
+  completed?: number;
+}
+
+export interface MessageTextPart {
+  type: "text";
+  text: string;
+}
+
+export type MessagePart = MessageTextPart | MessageReasoningPart | MessageToolPart;
+
+/** A user or assistant message restored from GET /api/session/{id}/message. */
 export interface BridgeMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
   created?: number;
+  /** Structured assistant content (text/reasoning/tool); text-only for users. */
+  parts?: MessagePart[];
+  agent?: string;
+  model?: ModelRef;
+  files?: string[];
+  cost?: number;
+  tokens?: TokenUsage;
 }
 
 export interface ModelRef {
   providerID: string;
   modelID: string;
+  variant?: string;
+}
+
+export interface BridgeAgent {
+  id: string;
+  name: string;
+  description?: string;
+  mode: "primary" | "subagent" | "all" | string;
+  hidden: boolean;
+  model?: ModelRef;
+}
+
+export interface BridgeCommand {
+  name: string;
+  description?: string;
+  template?: string;
+  agent?: string;
+  model?: ModelRef;
+  subtask?: boolean;
+}
+
+export interface BridgeSkill {
+  id: string;
+  name: string;
+  description?: string;
+  path: string;
+}
+
+export interface BridgeSessionSummary {
+  id: string;
+  title: string;
+  directory?: string;
+  updated?: number;
+  created?: number;
+  agent?: string;
+  model?: ModelRef;
+  busy?: boolean;
+}
+
+export interface PermissionRequest {
+  id: string;
+  sessionID: string;
+  action: string;
+  resources: string[];
+  save?: string[];
+  metadata?: Record<string, unknown>;
+  source?: Record<string, unknown>;
+  message?: string;
+}
+
+export type PermissionDecision = "once" | "always" | "reject";
+
+export interface FormOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+export interface FormField {
+  key: string;
+  title?: string;
+  description?: string;
+  type: string;
+  required?: boolean;
+  hidden?: boolean;
+  placeholder?: string;
+  default?: unknown;
+  options?: FormOption[];
+  custom?: boolean;
+  when?: Array<{ key: string; op: "eq" | "neq"; value: unknown }>;
+  minLength?: number;
+  maxLength?: number;
+  minItems?: number;
+  maxItems?: number;
+  minimum?: number;
+  maximum?: number;
+}
+
+/** A pending form (the v2.3.0 replacement for `question.v2.asked`). */
+export interface FormInfo {
+  id: string;
+  sessionID: string;
+  title: string;
+  fields: FormField[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface FileDiffInfo {
+  file: string;
+  patch: string;
+  additions: number;
+  deletions: number;
+  status: "added" | "deleted" | "modified" | string;
 }
 
 interface PromptOptions {
@@ -89,6 +252,53 @@ function errorMessage(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+/** Tokens for one step (`TokenUsage.Info`). */
+export function parseTokens(value: unknown): TokenUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const obj = value as Record<string, unknown>;
+  const cache = (obj.cache && typeof obj.cache === "object" ? obj.cache : {}) as Record<
+    string,
+    unknown
+  >;
+  return {
+    input: Number(obj.input ?? 0) || 0,
+    output: Number(obj.output ?? 0) || 0,
+    reasoning: Number(obj.reasoning ?? 0) || 0,
+    cache: { read: Number(cache.read ?? 0) || 0, write: Number(cache.write ?? 0) || 0 },
+  };
+}
+
+const FILE_TOOL_INPUT_KEYS = ["path", "filePath", "file_path", "filename", "target"];
+
+/**
+ * File paths touched by a tool call. `session.tool.success` in v2.3.0 does
+ * NOT reliably include `outputPaths`; for write/edit tools the absolute or
+ * workspace-relative path is in `input.path`. Both are supported.
+ */
+export function toolFilePaths(tool: {
+  name: string;
+  input: Record<string, unknown> | string;
+  metadata?: Record<string, unknown>;
+}): string[] {
+  const paths = new Set<string>();
+  if (typeof tool.input === "object" && tool.input) {
+    for (const key of FILE_TOOL_INPUT_KEYS) {
+      const value = tool.input[key];
+      if (typeof value === "string" && value.trim()) paths.add(value.trim());
+    }
+  }
+  const metadata = tool.metadata;
+  if (metadata) {
+    if (Array.isArray(metadata.outputPaths)) {
+      for (const p of metadata.outputPaths) if (typeof p === "string" && p) paths.add(p);
+    }
+    if (Array.isArray(metadata.files)) {
+      for (const p of metadata.files) if (typeof p === "string" && p) paths.add(p);
+    }
+  }
+  return [...paths];
 }
 
 /**
@@ -245,22 +455,34 @@ export class OpencodeBridgeClient {
     };
   }
 
-  /** Create a new chat session on the server. */
+  /** Build the `Model.Ref` body shape verified in the v2.3.0 spec. */
+  private modelBody(model: ModelRef): Record<string, unknown> {
+    return {
+      id: model.modelID,
+      providerID: model.providerID,
+      ...(model.variant ? { variant: model.variant } : {}),
+    };
+  }
+
+  /** Create a new chat session on the server (`POST /api/session`). */
   async createSession(opts: {
     title?: string;
     directory?: string;
     model?: ModelRef;
+    agent?: string;
   }): Promise<BridgeSession> {
-    const client = this.requireClient();
+    this.requireClient();
     try {
-      this.debugLog(`Creating session: title=${opts.title ?? "New chat"}`);
-      const resp = await client.session.create({
+      this.debugLog(
+        `Creating session: title=${opts.title ?? "New chat"} agent=${opts.agent ?? "default"}`
+      );
+      const resp = await this.fetchJSON("/session", {
+        method: "POST",
         body: {
           title: opts.title ?? "New chat",
-          ...(opts.directory ? { directory: opts.directory } : {}),
-          ...(opts.model
-            ? { model: { id: opts.model.modelID, providerID: opts.model.providerID } }
-            : {}),
+          ...(opts.directory ? { location: { directory: opts.directory } } : {}),
+          ...(opts.agent ? { agent: opts.agent } : {}),
+          ...(opts.model ? { model: this.modelBody(opts.model) } : {}),
         },
       });
       const session = this.unwrapSession(resp);
@@ -281,9 +503,11 @@ export class OpencodeBridgeClient {
   async prompt(opts: PromptOptions): Promise<{ messageID: string }> {
     this.requireClient();
     try {
+      // v2.3.0 prompt body is { text, files?, agents?, skills?, metadata?,
+      // delivery?, resume? } — model/variant are NOT accepted here. The
+      // controller switches the session model first (POST /session/{id}/model).
       this.debugLog(`Sending prompt to session ${opts.sessionID} (${opts.text.length} chars)`);
       const body: Record<string, unknown> = { text: opts.text };
-      if (opts.model) body.model = { id: opts.model.modelID, providerID: opts.model.providerID };
       const resp = await this.fetchJSON(`/session/${encodeURIComponent(opts.sessionID)}/prompt`, {
         method: "POST",
         body,
@@ -355,12 +579,43 @@ export class OpencodeBridgeClient {
       if (Array.isArray(arr)) {
         for (const m of arr) {
           const obj = m as Record<string, unknown>;
+          const limit = obj.limit as Record<string, unknown> | undefined;
+          const modelsCost = Array.isArray(obj.cost) ? (obj.cost as ModelCost[]) : undefined;
+          const variants = Array.isArray(obj.variants)
+            ? obj.variants
+                .map((v) =>
+                  typeof v === "string"
+                    ? { id: v }
+                    : v && typeof v === "object" && typeof (v as Record<string, unknown>).id === "string"
+                      ? {
+                          id: String((v as Record<string, unknown>).id),
+                          settings:
+                            (v as Record<string, unknown>).settings &&
+                            typeof (v as Record<string, unknown>).settings === "object"
+                              ? ((v as Record<string, unknown>).settings as Record<string, unknown>)
+                              : undefined,
+                        }
+                      : null
+                )
+                .filter((v): v is { id: string; settings?: Record<string, unknown> } => v !== null)
+            : undefined;
           models.push({
             id: String(obj.id ?? ""),
             modelID: String(obj.modelID ?? obj.id ?? ""),
             providerID: String(obj.providerID ?? ""),
             type: String(obj.type ?? "chat"),
             name: String(obj.name ?? obj.modelID ?? obj.id ?? ""),
+            ...(limit
+              ? {
+                  limit: {
+                    context: Number(limit.context ?? 0),
+                    ...(typeof limit.input === "number" ? { input: Number(limit.input) } : {}),
+                    output: Number(limit.output ?? 0),
+                  },
+                }
+              : {}),
+            ...(variants ? { variants } : {}),
+            ...(modelsCost ? { cost: modelsCost } : {}),
           });
         }
       }
@@ -412,9 +667,11 @@ export class OpencodeBridgeClient {
     try {
       await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/model`, {
         method: "POST",
-        body: { id: model.modelID, providerID: model.providerID },
+        body: { model: this.modelBody(model) },
       });
-      this.debugLog(`Session model set to ${model.providerID}/${model.modelID}`);
+      this.debugLog(
+        `Session model set to ${model.providerID}/${model.modelID}${model.variant ? `#${model.variant}` : ""}`
+      );
     } catch (err) {
       throw new Error(`Failed to set session model: ${errorMessage(err)}`);
     }
@@ -450,18 +707,98 @@ export class OpencodeBridgeClient {
         }
 
         if (type === "assistant") {
-          const parts = Array.isArray(obj.content) ? obj.content : [];
+          const rawParts = Array.isArray(obj.content) ? obj.content : [];
+          const parts: MessagePart[] = [];
           const texts: string[] = [];
-          for (const part of parts) {
+          const files = new Set<string>();
+          for (const part of rawParts) {
             const p = part as Record<string, unknown>;
-            if (p.type === "text" && typeof p.text === "string" && p.text) texts.push(p.text);
+            if (p.type === "text" && typeof p.text === "string") {
+              if (p.text) {
+                texts.push(p.text);
+                parts.push({ type: "text", text: p.text });
+              }
+              continue;
+            }
+            if (p.type === "reasoning" && typeof p.text === "string") {
+              const time = p.time as Record<string, unknown> | undefined;
+              parts.push({
+                type: "reasoning",
+                text: p.text,
+                created: time ? Number(time.created ?? 0) || undefined : undefined,
+                completed: time ? Number(time.completed ?? 0) || undefined : undefined,
+              });
+              continue;
+            }
+            if (p.type === "tool") {
+              const state = (p.state && typeof p.state === "object" ? p.state : {}) as Record<string, unknown>;
+              const status = String(state.status ?? "completed");
+              const content = Array.isArray(state.content)
+                ? (state.content as Array<Record<string, unknown>>).map((c) => ({
+                    ...c,
+                    type: String(c.type ?? "text"),
+                    text: typeof c.text === "string" ? c.text : undefined,
+                  }))
+                : undefined;
+              const errorObj = state.error as Record<string, unknown> | undefined;
+              const error =
+                errorObj && typeof errorObj.message === "string" ? errorObj.message : undefined;
+              const time = p.time as Record<string, unknown> | undefined;
+              const input =
+                state.input && typeof state.input === "object"
+                  ? (state.input as Record<string, unknown>)
+                  : typeof state.input === "string"
+                    ? state.input
+                    : {};
+              const tool: MessageToolPart = {
+                type: "tool",
+                id: String(p.id ?? ""),
+                name: String(p.name ?? ""),
+                status: (["streaming", "running", "completed", "error"].includes(status)
+                  ? status
+                  : "completed") as MessageToolPart["status"],
+                input,
+                ...(content ? { content } : {}),
+                ...(state.metadata && typeof state.metadata === "object"
+                  ? { metadata: state.metadata as Record<string, unknown> }
+                  : {}),
+                ...(error ? { error } : {}),
+                ...(p.executed === true ? { executed: true } : {}),
+                created: time ? Number(time.created ?? 0) || undefined : undefined,
+                completed: time ? Number(time.completed ?? 0) || undefined : undefined,
+              };
+              parts.push(tool);
+              for (const f of toolFilePaths(tool)) files.add(f);
+              continue;
+            }
           }
-          if (texts.length > 0) {
+          const snapshot = obj.snapshot as Record<string, unknown> | undefined;
+          if (snapshot && Array.isArray(snapshot.files)) {
+            for (const f of snapshot.files) if (typeof f === "string") files.add(f);
+          }
+          const modelObj = obj.model as Record<string, unknown> | undefined;
+          const model =
+            modelObj && typeof modelObj.providerID === "string"
+              ? {
+                  providerID: String(modelObj.providerID),
+                  modelID: String(modelObj.id ?? ""),
+                  ...(typeof modelObj.variant === "string" ? { variant: modelObj.variant } : {}),
+                }
+              : undefined;
+          if (parts.length > 0) {
             messages.push({
               id: String(obj.id ?? ""),
               role: "assistant",
               text: texts.join("\n\n"),
               created,
+              parts,
+              ...(typeof obj.agent === "string" ? { agent: obj.agent } : {}),
+              ...(model ? { model } : {}),
+              ...(files.size > 0 ? { files: [...files] } : {}),
+              ...(typeof obj.cost === "number" ? { cost: obj.cost } : {}),
+              ...(obj.tokens && typeof obj.tokens === "object"
+                ? { tokens: parseTokens(obj.tokens) }
+                : {}),
             });
           }
         }
@@ -472,6 +809,400 @@ export class OpencodeBridgeClient {
       this.debugLog(`getMessages failed: ${errorMessage(err)}`);
       throw new Error(`Failed to load message history: ${errorMessage(err)}`);
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Agents / commands / skills / sessions                              */
+  /* ------------------------------------------------------------------ */
+
+  private withDirectory(path: string, directory?: string): string {
+    if (!directory) return path;
+    return `${path}${path.includes("?") ? "&" : "?"}directory=${encodeURIComponent(directory)}`;
+  }
+
+  /** GET /api/agent — primary/subagent agents. */
+  async getAgents(directory?: string): Promise<BridgeAgent[]> {
+    this.requireClient();
+    try {
+      const resp = await this.fetchWithRetry(this.withDirectory("/agent", directory), {
+        method: "GET",
+      });
+      const arr = this.extractDataArray(resp) ?? [];
+      const agents: BridgeAgent[] = [];
+      for (const raw of arr) {
+        const obj = raw as Record<string, unknown>;
+        const modelObj = obj.model as Record<string, unknown> | undefined;
+        agents.push({
+          id: String(obj.id ?? ""),
+          name: String(obj.name ?? obj.id ?? ""),
+          description: typeof obj.description === "string" ? obj.description : undefined,
+          mode: String(obj.mode ?? "primary"),
+          hidden: obj.hidden === true,
+          ...(modelObj && typeof modelObj.providerID === "string"
+            ? {
+                model: {
+                  providerID: String(modelObj.providerID),
+                  modelID: String(modelObj.id ?? ""),
+                  ...(typeof modelObj.variant === "string" ? { variant: modelObj.variant } : {}),
+                },
+              }
+            : {}),
+        });
+      }
+      this.debugLog(`Found ${agents.length} agents`);
+      return agents;
+    } catch (err) {
+      throw new Error(`Failed to list agents (GET /api/agent): ${errorMessage(err)}`);
+    }
+  }
+
+  /** POST /api/session/{id}/agent — switch the session's agent. */
+  async setSessionAgent(sessionID: string, agent: string): Promise<void> {
+    this.requireClient();
+    try {
+      await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/agent`, {
+        method: "POST",
+        body: { agent },
+      });
+      this.debugLog(`Session ${sessionID} agent set to ${agent}`);
+    } catch (err) {
+      throw new Error(`Failed to switch agent: ${errorMessage(err)}`);
+    }
+  }
+
+  /** GET /api/command — custom commands (name + description). */
+  async getCommands(directory?: string): Promise<BridgeCommand[]> {
+    this.requireClient();
+    try {
+      const resp = await this.fetchWithRetry(this.withDirectory("/command", directory), {
+        method: "GET",
+      });
+      const arr = this.extractDataArray(resp) ?? [];
+      return arr
+        .map((raw) => {
+          const obj = raw as Record<string, unknown>;
+          return { name: String(obj.name ?? ""), description: String(obj.description ?? "") };
+        })
+        .filter((c) => c.name);
+    } catch (err) {
+      // Commands are optional; the palette still works with built-ins.
+      this.debugLog(`getCommands failed: ${errorMessage(err)}`);
+      return [];
+    }
+  }
+
+  /** GET /api/skill — available skills for the palette. */
+  async getSkills(directory?: string): Promise<BridgeSkill[]> {
+    this.requireClient();
+    try {
+      const resp = await this.fetchWithRetry(this.withDirectory("/skill", directory), {
+        method: "GET",
+      });
+      const arr = this.extractDataArray(resp) ?? [];
+      return arr
+        .map((raw) => {
+          const obj = raw as Record<string, unknown>;
+          return {
+            id: String(obj.id ?? ""),
+            name: String(obj.name ?? obj.id ?? ""),
+            description: typeof obj.description === "string" ? obj.description : undefined,
+            path: String(obj.path ?? ""),
+          };
+        })
+        .filter((s) => s.name);
+    } catch (err) {
+      this.debugLog(`getSkills failed: ${errorMessage(err)}`);
+      return [];
+    }
+  }
+
+  /** GET /api/session — newest first, cursor pagination, search. */
+  async listSessions(opts: {
+    limit?: number;
+    order?: "asc" | "desc";
+    search?: string;
+    directory?: string;
+    cursor?: string;
+  } = {}): Promise<{ sessions: BridgeSessionSummary[]; next?: string }> {
+    this.requireClient();
+    const params = new URLSearchParams();
+    params.set("limit", String(opts.limit ?? 30));
+    params.set("order", opts.order ?? "desc");
+    if (opts.search) params.set("search", opts.search);
+    if (opts.directory) params.set("directory", opts.directory);
+    if (opts.cursor) params.set("cursor", opts.cursor);
+    try {
+      const resp = await this.fetchWithRetry(`/session?${params.toString()}`, { method: "GET" });
+      const arr = this.extractDataArray(resp) ?? [];
+      const cursor =
+        resp && typeof resp === "object"
+          ? ((resp as Record<string, unknown>).cursor as Record<string, unknown> | undefined)
+          : undefined;
+      const next =
+        cursor && typeof cursor.next === "string" ? cursor.next : undefined;
+      const sessions = arr.map((raw) => {
+        const obj = raw as Record<string, unknown>;
+        const time = (obj.time && typeof obj.time === "object" ? obj.time : {}) as Record<
+          string,
+          unknown
+        >;
+        const loc = (obj.location && typeof obj.location === "object" ? obj.location : {}) as Record<
+          string,
+          unknown
+        >;
+        const modelObj = (obj.model && typeof obj.model === "object" ? obj.model : undefined) as
+          | Record<string, unknown>
+          | undefined;
+        return {
+          id: String(obj.id ?? ""),
+          title: String(obj.title ?? "Untitled"),
+          ...(typeof loc.directory === "string" ? { directory: loc.directory } : {}),
+          ...(typeof time.updated === "number" ? { updated: time.updated } : {}),
+          ...(typeof time.created === "number" ? { created: time.created } : {}),
+          ...(typeof obj.agent === "string" ? { agent: obj.agent } : {}),
+          ...(modelObj && typeof modelObj.providerID === "string"
+            ? {
+                model: {
+                  providerID: String(modelObj.providerID),
+                  modelID: String(modelObj.id ?? ""),
+                  ...(typeof modelObj.variant === "string" ? { variant: modelObj.variant } : {}),
+                },
+              }
+            : {}),
+          busy: typeof time.busy === "number" && (time.idle === undefined || time.busy > Number(time.idle ?? 0)),
+        };
+      });
+      return { sessions, next };
+    } catch (err) {
+      throw new Error(`Failed to list sessions: ${errorMessage(err)}`);
+    }
+  }
+
+  /** GET /api/session/active — map of session id -> {type:"running"}. */
+  async getActiveSessions(): Promise<string[]> {
+    this.requireClient();
+    try {
+      const resp = await this.fetchJSON("/session/active", { method: "GET" });
+      const data =
+        resp && typeof resp === "object"
+          ? ((resp as Record<string, unknown>).data as Record<string, unknown> | undefined)
+          : undefined;
+      return data ? Object.keys(data).filter((id) => id.startsWith("ses")) : [];
+    } catch (err) {
+      this.debugLog(`getActiveSessions failed: ${errorMessage(err)}`);
+      return [];
+    }
+  }
+
+  /** GET /api/session/{id} — one session (agent/model/status). */
+  async getSession(sessionID: string): Promise<BridgeSessionSummary | null> {
+    this.requireClient();
+    try {
+      const resp = await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}`, {
+        method: "GET",
+      });
+      const data =
+        resp && typeof resp === "object"
+          ? ((resp as Record<string, unknown>).data as Record<string, unknown> | undefined)
+          : undefined;
+      if (!data) return null;
+      const time = (data.time && typeof data.time === "object" ? data.time : {}) as Record<
+        string,
+        unknown
+      >;
+      const loc = (data.location && typeof data.location === "object" ? data.location : {}) as Record<
+        string,
+        unknown
+      >;
+      const modelObj = (data.model && typeof data.model === "object" ? data.model : undefined) as
+        | Record<string, unknown>
+        | undefined;
+      return {
+        id: String(data.id ?? sessionID),
+        title: String(data.title ?? "Untitled"),
+        ...(typeof loc.directory === "string" ? { directory: loc.directory } : {}),
+        ...(typeof time.updated === "number" ? { updated: time.updated } : {}),
+        ...(typeof time.created === "number" ? { created: time.created } : {}),
+        ...(typeof data.agent === "string" ? { agent: data.agent } : {}),
+        ...(modelObj && typeof modelObj.providerID === "string"
+          ? {
+              model: {
+                providerID: String(modelObj.providerID),
+                modelID: String(modelObj.id ?? ""),
+                ...(typeof modelObj.variant === "string" ? { variant: modelObj.variant } : {}),
+              },
+            }
+          : {}),
+      };
+    } catch (err) {
+      this.debugLog(`getSession failed: ${errorMessage(err)}`);
+      return null;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Permissions / forms / compaction / revert / diff                   */
+  /* ------------------------------------------------------------------ */
+
+  /** GET /api/session/{id}/permission — pending permission requests. */
+  async getPermissions(sessionID: string): Promise<PermissionRequest[]> {
+    this.requireClient();
+    const data = await this.fetchJSON(
+      `/session/${encodeURIComponent(sessionID)}/permission`,
+      { method: "GET" }
+    );
+    const arr = this.extractDataArray(data) ?? [];
+    return arr.map((raw) => {
+      const obj = raw as Record<string, unknown>;
+      return {
+        id: String(obj.id ?? ""),
+        sessionID: String(obj.sessionID ?? sessionID),
+        action: String(obj.action ?? ""),
+        resources: Array.isArray(obj.resources)
+          ? obj.resources.filter((r): r is string => typeof r === "string")
+          : [],
+        save: Array.isArray(obj.save)
+          ? obj.save.filter((r): r is string => typeof r === "string")
+          : undefined,
+        metadata:
+          obj.metadata && typeof obj.metadata === "object"
+            ? (obj.metadata as Record<string, unknown>)
+            : undefined,
+        source:
+          obj.source && typeof obj.source === "object"
+            ? (obj.source as Record<string, unknown>)
+            : undefined,
+        message: typeof obj.message === "string" ? obj.message : undefined,
+      };
+    });
+  }
+
+  /** POST /api/session/{id}/permission/{requestID}/reply. */
+  async replyPermission(
+    sessionID: string,
+    requestID: string,
+    decision: PermissionDecision,
+    message?: string
+  ): Promise<void> {
+    this.requireClient();
+    await this.fetchJSON(
+      `/session/${encodeURIComponent(sessionID)}/permission/${encodeURIComponent(requestID)}/reply`,
+      { method: "POST", body: message ? { decision, message } : { decision } }
+    );
+    this.debugLog(`Permission ${requestID} replied: ${decision}`);
+  }
+
+  /** GET /api/session/{id}/form — pending question forms. */
+  async getForms(sessionID: string): Promise<FormInfo[]> {
+    this.requireClient();
+    try {
+      const resp = await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/form`, {
+        method: "GET",
+      });
+      const arr = this.extractDataArray(resp) ?? [];
+      return arr.map((raw) => {
+        const obj = raw as Record<string, unknown>;
+        return {
+          id: String(obj.id ?? ""),
+          sessionID: String(obj.sessionID ?? sessionID),
+          title: String(obj.title ?? "Question"),
+          fields: Array.isArray(obj.fields) ? (obj.fields as FormField[]) : [],
+          metadata:
+            obj.metadata && typeof obj.metadata === "object"
+              ? (obj.metadata as Record<string, unknown>)
+              : undefined,
+        };
+      });
+    } catch (err) {
+      // Older servers expose /question instead of /form. The live event
+      // stream still shows questions, so a miss here is not fatal.
+      this.debugLog(`getForms failed: ${errorMessage(err)}`);
+      return [];
+    }
+  }
+
+  /** POST /api/session/{id}/form/{formID}/reply `{answer}`. */
+  async replyForm(
+    sessionID: string,
+    formID: string,
+    answer: Record<string, unknown>
+  ): Promise<void> {
+    this.requireClient();
+    await this.fetchJSON(
+      `/session/${encodeURIComponent(sessionID)}/form/${encodeURIComponent(formID)}/reply`,
+      { method: "POST", body: { answer } }
+    );
+    this.debugLog(`Form ${formID} replied`);
+  }
+
+  /** POST /api/session/{id}/compact. */
+  async compact(sessionID: string): Promise<void> {
+    this.requireClient();
+    await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/compact`, {
+      method: "POST",
+      body: {},
+    });
+    this.debugLog(`Compaction requested for ${sessionID}`);
+  }
+
+  /** POST /api/session/{id}/revert/stage. */
+  async stageRevert(sessionID: string, messageID: string, files?: boolean): Promise<void> {
+    this.requireClient();
+    await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/revert/stage`, {
+      method: "POST",
+      body: files === undefined ? { messageID } : { messageID, files },
+    });
+  }
+
+  /** POST /api/session/{id}/revert/commit. */
+  async commitRevert(sessionID: string): Promise<void> {
+    this.requireClient();
+    await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/revert/commit`, {
+      method: "POST",
+      body: {},
+    });
+  }
+
+  /** DELETE /api/session/{id}/revert (clear a staged revert). */
+  async clearRevert(sessionID: string): Promise<void> {
+    this.requireClient();
+    await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/revert`, {
+      method: "DELETE",
+    });
+  }
+
+  /** GET /api/session/{id}/diff — per-file patches for a turn. */
+  async getDiff(sessionID: string, from?: string, to?: string): Promise<FileDiffInfo[]> {
+    this.requireClient();
+    const params = new URLSearchParams();
+    if (from) params.set("from", from);
+    if (to) params.set("to", to);
+    const qs = params.toString();
+    const resp = await this.fetchJSON(
+      `/session/${encodeURIComponent(sessionID)}/diff${qs ? `?${qs}` : ""}`,
+      { method: "GET" }
+    );
+    const arr = this.extractDataArray(resp) ?? [];
+    return arr.map((raw) => {
+      const obj = raw as Record<string, unknown>;
+      return {
+        file: String(obj.file ?? ""),
+        patch: String(obj.patch ?? ""),
+        additions: Number(obj.additions ?? 0) || 0,
+        deletions: Number(obj.deletions ?? 0) || 0,
+        status: String(obj.status ?? "modified"),
+      };
+    });
+  }
+
+  /** POST /api/session/{id}/command — run a custom command by name. */
+  async runCommand(sessionID: string, name: string, text: string): Promise<void> {
+    this.requireClient();
+    await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/command`, {
+      method: "POST",
+      body: { name, text },
+    });
+    this.debugLog(`Command /${name} sent to ${sessionID}`);
   }
 
   /**

@@ -14,7 +14,7 @@
 
 /** A parsed SSE event relevant to chat rendering. */
 export interface BridgeEvent {
-  /** e.g. "session.text.delta", "session.execution.succeeded". */
+  /** Canonical event name (v2.3.0 names; v1.19.6 `session.next.*` is mapped). */
   type: string;
   /** The event's `data` object (payload.data), or the whole payload if absent. */
   data: unknown;
@@ -24,6 +24,51 @@ export interface BridgeEvent {
   id?: string;
   /** Raw parsed payload (for diagnostics). */
   raw?: unknown;
+  /** Original type when `type` was normalized from a v1.19.6 alias. */
+  rawType?: string;
+  /** Server creation timestamp (ms) when present. */
+  created?: number;
+}
+
+/**
+ * v1.19.6 (user-verified) event names → v2.3.0 canonical names.
+ *
+ * Everything else is passed through unchanged, so a newer server keeps
+ * working even if this table is incomplete.
+ */
+const EVENT_ALIASES: Record<string, string> = {
+  "session.next.reasoning.started": "session.reasoning.started",
+  "session.next.reasoning.delta": "session.reasoning.delta",
+  "session.next.reasoning.ended": "session.reasoning.ended",
+  "session.next.tool.input.started": "session.tool.input.started",
+  "session.next.tool.input.delta": "session.tool.input.delta",
+  "session.next.tool.input.ended": "session.tool.input.ended",
+  "session.next.tool.called": "session.tool.called",
+  "session.next.tool.progress": "session.tool.progress",
+  "session.next.tool.success": "session.tool.success",
+  "session.next.tool.failed": "session.tool.failed",
+  "session.next.step.started": "session.step.started",
+  "session.next.step.ended": "session.step.ended",
+  "session.next.step.failed": "session.step.failed",
+  "session.next.text.started": "session.text.started",
+  "session.next.text.delta": "session.text.delta",
+  "session.next.text.ended": "session.text.ended",
+  "session.next.agent.switched": "session.agent.selected",
+  "session.next.model.switched": "session.model.selected",
+  "session.next.compaction.started": "session.compaction.started",
+  "session.next.compaction.delta": "session.compaction.delta",
+  "session.next.compaction.ended": "session.compaction.ended",
+  "permission.v2.asked": "permission.asked",
+  "permission.v2.replied": "permission.replied",
+  "question.v2.asked": "form.created",
+  "question.v2.replied": "form.replied",
+  "question.v2.rejected": "form.cancelled",
+  "session.error": "session.execution.failed",
+};
+
+/** Map a server event name to the canonical v2.3.0 name. */
+export function normalizeEventType(type: string): string {
+  return EVENT_ALIASES[type] ?? type;
 }
 
 /** Incremental assistant text delta. */
@@ -54,13 +99,24 @@ export function parseEventPayload(payload: unknown, sseEvent?: string): BridgeEv
   }
 
   const payloadType = typeof obj.type === "string" ? obj.type : undefined;
-  const type = payloadType ?? sseEvent ?? "unknown";
+  const rawType = payloadType ?? sseEvent ?? "unknown";
+  const type = normalizeEventType(rawType);
   const data = "data" in obj ? obj.data : obj;
 
   let sessionID: string | undefined;
   const dataRec = asRecord(data);
   if (dataRec && typeof dataRec.sessionID === "string") {
     sessionID = dataRec.sessionID;
+  }
+  if (!sessionID && dataRec) {
+    // form.created carries the session inside `data.form`.
+    const form = asRecord(dataRec.form);
+    if (form && typeof form.sessionID === "string") sessionID = form.sessionID;
+  }
+  if (!sessionID && dataRec) {
+    // v1.19.6 question events sometimes nest under `question`.
+    const question = asRecord(dataRec.question);
+    if (question && typeof question.sessionID === "string") sessionID = question.sessionID;
   }
   if (!sessionID) {
     const durable = asRecord(obj.durable);
@@ -69,7 +125,16 @@ export function parseEventPayload(payload: unknown, sseEvent?: string): BridgeEv
   }
 
   const id = typeof obj.id === "string" ? obj.id : undefined;
-  return { type, data, sessionID, id, raw: payload };
+  const created = typeof obj.created === "number" ? obj.created : undefined;
+  return {
+    type,
+    data,
+    sessionID,
+    id,
+    raw: payload,
+    ...(rawType !== type ? { rawType } : {}),
+    ...(created !== undefined ? { created } : {}),
+  };
 }
 
 /**

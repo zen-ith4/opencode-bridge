@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ChatController } from "../test-build/chatController.js";
+import { readFileSync } from "node:fs";
+import {
+  ChatController,
+  contextUsedFromTokens,
+  toolKind,
+  toolTitle,
+} from "../test-build/chatController.js";
 import { parseEventPayload } from "../test-build/events.js";
 
 function wait(ms) {
@@ -31,6 +37,22 @@ class FakeClient {
 
     this.authHeader = undefined;
     this.baseUrl = undefined;
+
+    this.agents = [{ id: "build", name: "Build", mode: "primary", hidden: false }];
+    this.commands = [];
+    this.skills = [];
+    this.sessionSummaries = [];
+    this.sessionCursor = undefined;
+    this.activeSessions = [];
+    this.sessionDetails = {};
+    this.pendingPermissions = [];
+    this.pendingForms = [];
+    this.sessionAgents = [];
+    this.sessionModels = [];
+    this.permissionReplies = [];
+    this.formReplies = [];
+    this.compactions = [];
+    this.listSessionCalls = [];
   }
 
   async createSession(opts) {
@@ -91,6 +113,64 @@ class FakeClient {
 
   setBaseUrl(url) {
     this.baseUrl = url;
+  }
+
+  async getAgents(directory) {
+    this.agentsDirectory = directory;
+    return this.agents;
+  }
+
+  async getCommands(directory) {
+    this.commandsDirectory = directory;
+    return this.commands;
+  }
+
+  async getSkills(directory) {
+    this.skillsDirectory = directory;
+    return this.skills;
+  }
+
+  async listSessions(opts) {
+    this.listSessionCalls.push(opts);
+    return { sessions: this.sessionSummaries, next: this.sessionCursor };
+  }
+
+  async getActiveSessions() {
+    return this.activeSessions;
+  }
+
+  async getSession(sessionID) {
+    return this.sessionDetails[sessionID] ?? null;
+  }
+
+  async getPermissions(sessionID) {
+    this.pendingPermissionsSession = sessionID;
+    return this.pendingPermissions;
+  }
+
+  async getForms(sessionID) {
+    this.pendingFormsSession = sessionID;
+    return this.pendingForms;
+  }
+
+  async replyPermission(sessionID, requestID, decision, message) {
+    this.permissionReplies.push({ sessionID, requestID, decision, message });
+  }
+
+  async replyForm(sessionID, formID, answer) {
+    this.formReplies.push({ sessionID, formID, answer });
+  }
+
+  async setSessionAgent(sessionID, agent) {
+    this.sessionAgents.push([sessionID, agent]);
+  }
+
+  async setSessionModel(sessionID, model) {
+    this.sessionModels.push([sessionID, model]);
+  }
+
+  async compact(sessionID) {
+    this.compactions.push(sessionID);
   }
 }
 
@@ -362,6 +442,517 @@ test("a failed prompt shows one banner plus an inline prompt bubble", async () =
     assert.equal(banners.length, 1);
     assert.equal(banners[0].banner.kind, "error");
     assert.equal(controller.getBanner().kind, "error");
+  } finally {
+    controller.dispose();
+  }
+});
+
+/* ------------------------------------------------------------------------- */
+/* v2.3.0 feature reducer tests                                              */
+/* ------------------------------------------------------------------------- */
+
+const fixtureEvents = JSON.parse(
+  readFileSync(new URL("./fixtures/reasoning-tool-permission.json", import.meta.url), "utf8")
+);
+
+const FIXTURE_MODEL = {
+  id: "tidepool-alpha-free",
+  modelID: "tidepool-alpha-free",
+  providerID: "opencode",
+  name: "Tidepool Alpha",
+  limit: { context: 200000, output: 32000 },
+  variants: [{ id: "medium" }, { id: "high" }],
+};
+
+test("context math uses input + cache.read from the latest step", () => {
+  assert.equal(contextUsedFromTokens(undefined), 0);
+  assert.equal(
+    contextUsedFromTokens({ input: 100, output: 5, reasoning: 3, cache: { read: 50, write: 9 } }),
+    150
+  );
+  assert.equal(
+    contextUsedFromTokens({ input: -5, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }),
+    0
+  );
+  assert.equal(contextUsedFromTokens({ input: 100 }), 100, "missing cache is treated as zero");
+});
+
+test("tool titles and kinds map from verified tool inputs", () => {
+  assert.equal(toolTitle({ name: "read", input: { path: "src/a.ts" } }), "src/a.ts");
+  assert.equal(toolTitle({ name: "shell", input: { command: "npm test" } }), "npm test");
+  assert.equal(
+    toolTitle({ name: "grep", input: { pattern: "TODO", include: "src" } }),
+    "TODO in src"
+  );
+  assert.equal(toolTitle({ name: "todowrite", input: {} }), "Update todos");
+  assert.equal(toolKind("read"), "read");
+  assert.equal(toolKind("edit"), "edit");
+  assert.equal(toolKind("write"), "write");
+  assert.equal(toolKind("bash"), "bash");
+  assert.equal(toolKind("grep"), "search");
+  assert.equal(toolKind("webfetch"), "web");
+  assert.equal(toolKind("task"), "subagent");
+  assert.equal(toolKind("todowrite"), "todo");
+  assert.equal(toolKind("mystery"), "tool");
+});
+
+test("recorded reasoning -> tool -> permission -> text sequence reduces correctly", async () => {
+  const { client, posts, controller } = makeController({ options: { sessionID: "ses_fixture" } });
+  client.models = [FIXTURE_MODEL];
+  try {
+    controller.setSelectedModel({
+      providerID: "opencode",
+      modelID: "tidepool-alpha-free",
+    });
+    await controller.handleMessage({ type: "ready" });
+    posts.length = 0;
+
+    for (const event of fixtureEvents) client.emit(event);
+    await wait(0);
+
+    const reasoningStart = byType(posts, "reasoning-start");
+    assert.equal(reasoningStart.length, 1);
+    assert.equal(reasoningStart[0].messageID, "msg_fixture_assistant");
+
+    const reasoningDeltas = byType(posts, "reasoning-delta");
+    assert.equal(reasoningDeltas.length, 2);
+    assert.equal(
+      reasoningDeltas.at(-1).text,
+      "The user wants me to read a file. I should use the read tool."
+    );
+
+    const reasoningEnd = byType(posts, "reasoning-end");
+    assert.equal(reasoningEnd.length, 1);
+    assert.equal(
+      reasoningEnd[0].text,
+      "The user wants me to read a file. I should use the read tool."
+    );
+    assert.equal(typeof reasoningEnd[0].elapsedMs, "number");
+
+    const toolStarts = byType(posts, "tool-start");
+    assert.equal(toolStarts.length, 1);
+    assert.equal(toolStarts[0].tool.id, "call_fixture_read");
+    assert.equal(toolStarts[0].tool.kind, "read");
+
+    const toolUpdates = byType(posts, "tool-update");
+    const running = toolUpdates.find((message) => message.tool.status === "running");
+    assert.ok(running, "the tool must be marked running when called");
+    assert.equal(running.tool.title, ".env");
+    assert.equal(running.tool.input.path, ".env");
+
+    const done = toolUpdates.at(-1);
+    assert.equal(done.tool.status, "done");
+    assert.equal(done.tool.content[0].text, "SECRET=topsecret");
+
+    const permission = byType(posts, "permission-request");
+    assert.equal(permission.length, 1);
+    assert.equal(permission[0].request.id, "per_fixture_read");
+    assert.equal(permission[0].request.action, "read");
+    assert.deepEqual(permission[0].request.resources, [".env"]);
+    assert.deepEqual(permission[0].request.save, ["*"]);
+
+    const resolved = byType(posts, "permission-resolved");
+    assert.equal(resolved.length, 1);
+    assert.equal(resolved[0].requestID, "per_fixture_read");
+    assert.equal(resolved[0].decision, "once");
+
+    assert.equal(
+      byType(posts, "assistant-delta").at(-1).text,
+      "The .env file contains SECRET=topsecret."
+    );
+
+    const context = byType(posts, "context").at(-1);
+    assert.equal(context.used, 15900, "108 input + 15792 cache read from the final step");
+    assert.equal(context.limit, 200000);
+    assert.equal(context.percent, 8);
+    assert.equal(context.breakdown.cache.read, 15792);
+
+    assert.equal(byType(posts, "status").at(-1).status, "idle");
+    assert.equal(controller.isGenerating(), false);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("init exposes primary agents, commands and skills; agents can be selected and cycled", async () => {
+  const { client, posts, controller } = makeController({ options: { sessionID: "ses_agent" } });
+  client.agents = [
+    { id: "build", name: "Build", mode: "primary", hidden: false },
+    { id: "plan", name: "Plan", mode: "primary", hidden: false },
+    { id: "secret", name: "Hidden", mode: "primary", hidden: true },
+    { id: "explore", name: "Explore", mode: "subagent", hidden: false },
+  ];
+  client.commands = [{ name: "review", description: "Review changes" }];
+  client.skills = [{ id: "sk_1", name: "deploy", description: "Deploy", path: "/tmp/skill" }];
+  try {
+    await controller.handleMessage({ type: "ready" });
+    const init = byType(posts, "init").at(-1);
+    assert.deepEqual(init.agents.map((agent) => agent.id), ["build", "plan"]);
+    assert.equal(init.agent, "build");
+    assert.deepEqual(init.commands.map((command) => command.name), ["review"]);
+    assert.deepEqual(init.skills.map((skill) => skill.name), ["deploy"]);
+
+    await controller.handleMessage({ type: "selectAgent", agent: "plan" });
+    assert.deepEqual(client.sessionAgents, [["ses_agent", "plan"]]);
+    assert.equal(byType(posts, "agent-selected").at(-1).agent, "plan");
+
+    await controller.handleMessage({ type: "cycleAgent", step: -1 });
+    assert.equal(byType(posts, "agent-selected").at(-1).agent, "build");
+    assert.deepEqual(client.sessionAgents.at(-1), ["ses_agent", "build"]);
+
+    await controller.handleMessage({ type: "selectAgent", agent: "not-an-agent" });
+    assert.equal(byType(posts, "agent-selected").at(-1).agent, "build");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("model variants are listed and sent in the verified Model.Ref.variant field", async () => {
+  const { client, posts, controller } = makeController({ options: { sessionID: "ses_variant" } });
+  client.models = [
+    {
+      ...FIXTURE_MODEL,
+      variants: [{ id: "low" }, { id: "medium" }, { id: "high" }],
+    },
+  ];
+  try {
+    await controller.handleMessage({ type: "ready" });
+    const init = byType(posts, "init").at(-1);
+    assert.deepEqual(init.models[0].variants, ["low", "medium", "high"]);
+    assert.equal(init.models[0].contextLimit, 200000);
+
+    await controller.handleMessage({
+      type: "selectVariant",
+      model: { providerID: "opencode", modelID: "tidepool-alpha-free" },
+      variant: "high",
+    });
+    const selected = byType(posts, "model-selected").at(-1).selectedModel;
+    assert.equal(selected.variant, "high");
+    assert.deepEqual(client.sessionModels.at(-1), [
+      "ses_variant",
+      { providerID: "opencode", modelID: "tidepool-alpha-free", variant: "high" },
+    ]);
+
+    client.emit({
+      type: "session.model.selected",
+      id: "evt_variant_low",
+      data: {
+        sessionID: "ses_variant",
+        model: { id: "tidepool-alpha-free", providerID: "opencode", variant: "low" },
+      },
+    });
+    assert.equal(byType(posts, "model-selected").at(-1).selectedModel.variant, "low");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("session list uses search/directory/order and marks running sessions", async () => {
+  const { client, posts, controller } = makeController();
+  client.sessionSummaries = [
+    { id: "ses_new", title: "Newest", directory: "/tmp/workspace", updated: 30 },
+    { id: "ses_old", title: "Older", directory: "/tmp/workspace", updated: 10 },
+  ];
+  client.sessionCursor = "cursor_2";
+  client.activeSessions = ["ses_old"];
+  try {
+    await controller.handleMessage({ type: "ready" });
+    posts.length = 0;
+
+    await controller.handleMessage({ type: "listSessions", search: "old" });
+    const call = client.listSessionCalls.at(-1);
+    assert.equal(call.search, "old");
+    assert.equal(call.order, "desc");
+    assert.equal(call.limit, 30);
+    assert.equal(call.directory, "/tmp/workspace");
+
+    const sessions = byType(posts, "sessions").at(-1);
+    assert.deepEqual(sessions.sessions.map((session) => session.id), ["ses_new", "ses_old"]);
+    assert.equal(sessions.cursor, "cursor_2");
+    assert.equal(sessions.sessions[1].busy, true);
+    assert.equal(sessions.sessions[0].busy, false);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("switching sessions loads history, agent and model and persists the choice", async () => {
+  const persisted = [];
+  const { client, posts, controller } = makeController({
+    options: { persistSession: (sessionID) => persisted.push(sessionID) },
+  });
+  client.history = [
+    { id: "msg_u", role: "user", text: "hello", created: 1 },
+    { id: "msg_a", role: "assistant", text: "hi", created: 2 },
+  ];
+  client.sessionDetails.ses_old = {
+    id: "ses_old",
+    title: "Older",
+    agent: "plan",
+    model: { providerID: "opencode", modelID: "tidepool-alpha-free" },
+  };
+  try {
+    await controller.handleMessage({ type: "ready" });
+    posts.length = 0;
+
+    await controller.handleMessage({ type: "switchSession", sessionID: "ses_old" });
+    assert.equal(controller.getSessionID(), "ses_old");
+    assert.deepEqual(persisted, ["ses_old"]);
+
+    const selected = byType(posts, "session-selected").at(-1);
+    assert.equal(selected.sessionID, "ses_old");
+    assert.equal(selected.history.length, 2);
+    assert.equal(selected.agent, "plan");
+    assert.equal(selected.selectedModel.modelID, "tidepool-alpha-free");
+    assert.equal(client.pendingPermissionsSession, "ses_old");
+    assert.equal(client.pendingFormsSession, "ses_old");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("pending permissions and forms are replayed when the view reconnects", async () => {
+  const { client, posts, controller } = makeController({ options: { sessionID: "ses_pending" } });
+  client.pendingPermissions = [
+    {
+      id: "per_pending",
+      sessionID: "ses_pending",
+      action: "edit",
+      resources: ["src/a.ts"],
+    },
+  ];
+  client.pendingForms = [
+    { id: "frm_pending", sessionID: "ses_pending", title: "Pick one", fields: [] },
+  ];
+  try {
+    await controller.handleMessage({ type: "ready" });
+    assert.equal(byType(posts, "permission-request").at(-1).request.id, "per_pending");
+    assert.equal(byType(posts, "question-request").at(-1).form.id, "frm_pending");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("permissions ask by default; readOnlyAuto only auto-approves safe actions once", async () => {
+  {
+    const { client, posts, controller } = makeController({
+      options: { sessionID: "ses_perm_ask" },
+    });
+    try {
+      await controller.handleMessage({ type: "ready" });
+      posts.length = 0;
+      client.emit({
+        type: "permission.asked",
+        id: "evt_perm_ask_1",
+        data: {
+          id: "per_ask",
+          sessionID: "ses_perm_ask",
+          action: "read",
+          resources: ["README.md"],
+        },
+      });
+      await wait(0);
+      assert.equal(byType(posts, "permission-request").length, 1);
+      assert.equal(client.permissionReplies.length, 0);
+    } finally {
+      controller.dispose();
+    }
+  }
+
+  {
+    const { client, posts, controller } = makeController({
+      options: {
+        sessionID: "ses_perm_auto",
+        getPermissionsMode: () => "readOnlyAuto",
+      },
+    });
+    try {
+      await controller.handleMessage({ type: "ready" });
+      posts.length = 0;
+      client.emit({
+        type: "permission.asked",
+        id: "evt_perm_auto_read",
+        data: {
+          id: "per_read",
+          sessionID: "ses_perm_auto",
+          action: "read",
+          resources: ["README.md"],
+        },
+      });
+      await wait(0);
+      assert.equal(byType(posts, "permission-request").length, 0);
+      assert.equal(client.permissionReplies.length, 1);
+      assert.equal(client.permissionReplies[0].decision, "once");
+
+      client.emit({
+        type: "permission.asked",
+        id: "evt_perm_auto_edit",
+        data: {
+          id: "per_edit",
+          sessionID: "ses_perm_auto",
+          action: "edit",
+          resources: ["src/a.ts"],
+        },
+      });
+      await wait(0);
+      assert.equal(byType(posts, "permission-request").length, 1);
+      assert.equal(client.permissionReplies.length, 1, "edits are never auto-approved");
+    } finally {
+      controller.dispose();
+    }
+  }
+});
+
+test("permission and form replies use the verified reply payloads", async () => {
+  const { client, posts, controller } = makeController({ options: { sessionID: "ses_reply" } });
+  try {
+    await controller.handleMessage({ type: "ready" });
+    posts.length = 0;
+
+    await controller.handleMessage({
+      type: "replyPermission",
+      requestID: "per_1",
+      decision: "always",
+    });
+    assert.deepEqual(client.permissionReplies.at(-1), {
+      sessionID: "ses_reply",
+      requestID: "per_1",
+      decision: "always",
+      message: undefined,
+    });
+    assert.equal(byType(posts, "permission-resolved").at(-1).decision, "always");
+
+    client.emit({
+      type: "form.created",
+      id: "evt_form_created",
+      data: {
+        form: {
+          id: "frm_1",
+          sessionID: "ses_reply",
+          title: "Which file?",
+          fields: [
+            {
+              key: "answer",
+              title: "File",
+              type: "string",
+              options: [{ value: "a.ts", label: "a.ts" }],
+            },
+          ],
+        },
+      },
+    });
+    assert.equal(byType(posts, "question-request").at(-1).form.id, "frm_1");
+
+    await controller.handleMessage({
+      type: "replyForm",
+      formID: "frm_1",
+      answer: { answer: "a.ts" },
+    });
+    assert.deepEqual(client.formReplies.at(-1), {
+      sessionID: "ses_reply",
+      formID: "frm_1",
+      answer: { answer: "a.ts" },
+    });
+    assert.equal(byType(posts, "question-resolved").at(-1).formID, "frm_1");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("compaction events stream a running indicator and finish", async () => {
+  const { client, posts, controller } = makeController({ options: { sessionID: "ses_compact" } });
+  try {
+    await controller.handleMessage({ type: "ready" });
+    posts.length = 0;
+
+    client.emit({
+      type: "session.compaction.started",
+      id: "evt_comp_start",
+      data: { sessionID: "ses_compact", reason: "manual" },
+    });
+    assert.equal(byType(posts, "compaction").at(-1).compaction.running, true);
+
+    client.emit({
+      type: "session.compaction.delta",
+      id: "evt_comp_delta",
+      data: { sessionID: "ses_compact", text: "Summarizing…" },
+    });
+    assert.equal(byType(posts, "compaction").at(-1).compaction.text, "Summarizing…");
+
+    client.emit({
+      type: "session.compaction.ended",
+      id: "evt_comp_end",
+      data: { sessionID: "ses_compact", reason: "manual", text: "Done" },
+    });
+    const done = byType(posts, "compaction").at(-1).compaction;
+    assert.equal(done.running, false);
+    assert.equal(done.text, "Done");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("write/edit tool calls and step files produce files-changed", async () => {
+  const { client, posts, controller } = makeController({ options: { sessionID: "ses_files" } });
+  try {
+    await controller.handleMessage({ type: "ready" });
+    posts.length = 0;
+
+    client.emit({
+      type: "session.tool.input.started",
+      id: "evt_file_1",
+      data: {
+        sessionID: "ses_files",
+        assistantMessageID: "msg_files",
+        id: "call_write",
+        name: "write",
+      },
+    });
+    client.emit({
+      type: "session.tool.called",
+      id: "evt_file_2",
+      data: {
+        sessionID: "ses_files",
+        assistantMessageID: "msg_files",
+        id: "call_write",
+        input: { path: "src/new.ts", content: "export {}" },
+      },
+    });
+    client.emit({
+      type: "session.tool.success",
+      id: "evt_file_3",
+      data: {
+        sessionID: "ses_files",
+        assistantMessageID: "msg_files",
+        id: "call_write",
+        content: [{ type: "text", text: "wrote file" }],
+      },
+    });
+    client.emit({
+      type: "session.step.ended",
+      id: "evt_file_4",
+      data: {
+        sessionID: "ses_files",
+        assistantMessageID: "msg_files",
+        tokens: { input: 10, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        files: ["src/new.ts"],
+      },
+    });
+    client.emit({
+      type: "session.execution.succeeded",
+      id: "evt_file_5",
+      data: { sessionID: "ses_files" },
+    });
+    await wait(0);
+
+    const done = byType(posts, "tool-update").at(-1);
+    assert.equal(done.tool.kind, "write");
+    assert.equal(done.tool.title, "src/new.ts");
+    assert.deepEqual(done.tool.files, ["src/new.ts"]);
+
+    const files = byType(posts, "files-changed");
+    assert.ok(files.length >= 1);
+    assert.deepEqual(files.at(-1).files, ["src/new.ts"]);
   } finally {
     controller.dispose();
   }
