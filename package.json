@@ -84,6 +84,7 @@
         {
           "id": "opencode-bridge.chat",
           "name": "Chat",
+          "icon": "media/icon.png",
           "type": "webview"
         }
       ]
