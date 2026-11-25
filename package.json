@@ -163,6 +163,17 @@
           ],
           "default": "ask",
           "description": "How tool permission requests are handled. 'ask' (default) shows an Allow once / Allow always / Reject card for every request. 'readOnlyAuto' automatically answers read-only requests with 'once'; edits, writes, and shell commands are still always shown. 'always' is never chosen automatically."
+        },
+        "opencodeBridge.autoStopRepetition": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically stop generation when the model falls into a degenerate repetition loop (one character or a short pattern repeated hundreds of times). When false (default), a warning banner lets you Stop, switch models, or dismiss."
+        },
+        "opencodeBridge.maxAttachmentBytes": {
+          "type": "number",
+          "default": 8388608,
+          "minimum": 1024,
+          "description": "Largest file (in bytes) that can be attached to a prompt. Files above this are refused before the prompt is sent; files above ~1 MB are attached with a warning."
         }
       }
     }
@@ -184,6 +195,7 @@
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^6.0.0",
     "@typescript-eslint/parser": "^6.0.0",
+    "@vscode/codicons": "^0.0.46-24",
     "@vscode/vsce": "^4.1.1",
     "esbuild": "^0.19.0",
     "eslint": "^8.0.0",

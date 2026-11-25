@@ -11,6 +11,8 @@
     "src/log.ts",
     "src/events.ts",
     "src/client.ts",
+    "src/errors.ts",
+    "src/repetition.ts",
     "src/managedServer.ts",
     "src/chatController.ts"
   ],

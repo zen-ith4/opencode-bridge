@@ -34,11 +34,16 @@ key configuration. Model inference stays inside that server.
   the full width. Timestamps appear on hover.
 - Live streaming through the server's `/api/event` SSE stream with a typing
   indicator, exactly one subscription, reconnect with backoff, and duplicate
-  event-id protection.
+  event-id protection. Each event sends **only the new chunk** to the webview;
+  the full accumulated answer is never re-sent per delta, so postMessage
+  traffic stays linear instead of quadratic.
 - Markdown: headings, lists, blockquotes, bold/italic, inline code, simple
   tables, and links limited to `http:`, `https:` and `mailto:`. Raw HTML is
-  escaped. Code blocks have a language label, Copy (copies the original raw
-  code) and a Wrap toggle.
+  escaped, and `javascript:`, `data:`, `vbscript:` and protocol-relative
+  (`//host`) links are rendered as text. Code blocks have a language label,
+  Copy (copies the original raw code) and a Wrap toggle. Code blocks and tool
+  input/output (`<pre>`) are forced `dir="ltr"` with left alignment so mixed
+  Persian/English code does not reorder; prose stays `dir="auto"`.
 - Composer auto-grows up to about 8 lines. `Enter` sends,
   `Shift+Enter` inserts a newline. Send turns into Stop while generating.
 - Smart auto-scroll: if you scroll up, streaming stops following and a
@@ -51,6 +56,36 @@ key configuration. Model inference stays inside that server.
 - One dismissible banner with a Details expander and contextual actions
   (Retry, Enter password, Open logs, Cancel). Inline bubbles are only used for
   failed prompts.
+
+### Long streams and runaway output
+
+Long answers used to re-parse the whole Markdown document on every delta,
+which is O(n²) and freezes the webview on stories of a few hundred thousand
+characters. The renderer is now incremental and coalesced:
+
+- Deltas are accumulated in the webview. Completed top-level Markdown blocks
+  (a blank line outside a fenced code block) are rendered **once** and
+  appended; only the still-open tail is re-rendered.
+- Renders are coalesced to at most one per `requestAnimationFrame`, and the
+  final `assistant-end` does one full pass so the finished answer is complete.
+- Scroll stickiness is preserved: rendering never yanks the view if you have
+  scrolled up.
+- Above **~200,000 characters** live Markdown stops. The message switches to a
+  plain-text tail with a “Show full output” toggle (and back to “Show tail
+  only”), so the panel stays responsive. The full text remains available.
+- A **repetition guard** watches only the trailing ~400 characters. More than
+  200 copies of one character, or a short pattern repeated at least 8 times
+  over ≥160 characters, raises a banner with **Stop**, **Stop and retry with a
+  different model**, and **Dismiss**. The message is kept and the banner names
+  the model. Set `opencodeBridge.autoStopRepetition` to `true` to interrupt
+  automatically instead of asking.
+- `session.execution.failed`, `session.step.failed` and provider-level tool
+  failures are classified (connection, authentication, rate limit, model,
+  extension). The banner names the model/provider, says plainly whether this
+  is an extension error, and offers **Retry**, **Switch model**, **Open logs**
+  and, when the provider rejected the request, **Enter password**. Partial
+  text is kept, marked **incomplete**, and gets a **Continue** button that
+  sends a follow-up asking the model to resume at the cut-off point.
 
 ### Thinking, tools, permissions and questions
 
@@ -145,7 +180,7 @@ key configuration. Model inference stays inside that server.
 npm install
 npm run typecheck    # tsc --noEmit (includes the esbuild entry)
 npm run lint
-npm test             # markdown / slash / events / controller / managed-server tests
+npm test             # markdown / slash / events / controller / streaming / managed-server tests
 ```
 
 Press **F5**. The preLaunch task `OpenCode Bridge: bundle` runs
@@ -178,7 +213,12 @@ The script starts a real managed server with a random password and checks:
   with the expected shapes,
 - the ready handshake opens exactly one SSE subscription,
 - a prompt is accepted and SSE events are parsed,
-- event ids are applied at most once and streamed text is not duplicated.
+- event ids are applied at most once and streamed text is not duplicated,
+- `assistant-delta` messages carry only `delta` (never the full accumulated
+  text), and the concatenated deltas match the server's text events.
+
+A full run against a local `opencode v2.3.0` with a configured provider exits
+`0` and covers the managed-server restart and auth enforcement as well.
 
 If no model provider is reachable, the script still reports the structural
 result and says that no reply was received.
@@ -195,7 +235,8 @@ result and says that no reply was received.
   "opencodeBridge.model": "",
   "opencodeBridge.responseTimeoutSeconds": 120,
   "opencodeBridge.debug": false,
-  "opencodeBridge.permissions": "ask"
+  "opencodeBridge.permissions": "ask",
+  "opencodeBridge.autoStopRepetition": false
 }
 ```
 
@@ -209,6 +250,7 @@ result and says that no reply was received.
 | `responseTimeoutSeconds` | `120` | Quiet time before a non-blocking "Still waiting" status with Cancel. Reset by any event for the current session. |
 | `debug` | `false` | Verbose lines in the Output channel. |
 | `permissions` | `"ask"` | `"ask"` shows a card for every permission request. `"readOnlyAuto"` auto-replies `"once"` to read-only requests only. |
+| `autoStopRepetition` | `false` | Stop generation automatically when a degenerate repetition loop is detected. When `false`, a banner offers Stop / switch model / Dismiss. |
 
 ## Password handling
 
@@ -246,6 +288,9 @@ v2.3.0 and its `/openapi.json` (fetched with Basic auth):
 - SSE payloads are `data: {"id","created","type","data"}` with **no** `event:`
   line; text and reasoning chunks are in `data.delta`. v1.19.6
   `session.next.*` aliases are normalized, so newer servers keep working.
+- The bridge forwards text deltas as deltas. `session.text.ended` is used only
+  to correct a missed chunk (a `resync` replacement), and history restore is
+  the only other place a full text snapshot is sent.
 - Canonical events used: `session.reasoning.*`, `session.tool.*`,
   `session.step.*`, `permission.asked/replied`, `form.created/replied/cancelled`,
   `session.agent.selected`, `session.model.selected`, `session.status`,
@@ -295,9 +340,53 @@ the live structural endpoints. These UI behaviours still need a human:
 8. **Context meter and variants.** Check `used / limit`, tooltip breakdown and
    the yellow/red thresholds; run **Compact** and watch progress. If the model
    has variants, switch one and confirm the next step reports that variant.
+9. **Long Persian story (streaming hardening).** Switch to a fast model and
+   send:
+   `یک داستان فارسی بسیار طولانی درباره‌ی پادشاه، سه دخترش و سفری به ستاره‌ها بنویس؛ حداقل چند هزار کلمه، با تیترها، فهرست‌ها و جدول.`
+   While it streams:
+   - text appears smoothly, without the panel freezing or the answer
+     flickering/re-parsing;
+   - scrolling up stops auto-follow and shows **Jump to latest**; scrolling
+     back to the bottom resumes follow;
+   - Markdown headings, lists, tables and code blocks render correctly, and
+     code/tool output stays left-to-right inside a right-to-left page;
+   - links render as links only for `http(s):`/`mailto:`; paste a
+     `javascript:` or `data:` link and confirm it stays plain text.
+   Above ~200,000 characters the message switches to the plain-text tail with
+   **Show full output**; toggle it and confirm the full text is still there
+   after the stream ends.
+10. **Runaway loop and provider failure.**
+    - Repetition: use a model/seed that loops (or temporarily lower the
+      detector threshold in a scratch build). A banner appears naming the
+      model with **Stop** / **Stop and retry with a different model** /
+      **Dismiss**; Dismiss keeps the text streaming. Set
+      `autoStopRepetition: true` and confirm it stops by itself.
+    - Failure: replay the recorded `ECONNRESET` sequence
+      (`test/streaming.test.mjs`) or disconnect the provider mid-answer. The
+      partial text stays, is marked **incomplete**, the banner says it is not
+      an extension error and names the model/provider, and **Continue** sends
+      a follow-up that resumes the answer.
 
 ## Error handling
 
+- **Streaming failures are attributed honestly.** `session.execution.failed`,
+  `session.step.failed` and provider-level `session.tool.failed` messages are
+  classified by `src/errors.ts`:
+  - **connection** (`ECONNRESET`, `fetch failed`, socket closed, timeout):
+    “OpenCode lost its connection to the model provider; this is not an
+    extension error.” Retryable.
+  - **authentication** (401/403, invalid key, OAuth): not retried; offers
+    **Enter password**.
+  - **rate limit** (429, quota, overloaded): retryable after a pause.
+  - **model** (unknown model, context length, provider 4xx/5xx): retryable,
+    usually worth switching models.
+  - **extension** (`TypeError`, `is not a function`, …): an actual bridge bug.
+  The banner always names the model (`provider/model`) and provider, keeps the
+  partial answer, marks it **incomplete**, and offers **Retry**, **Switch
+  model**, **Open logs** and **Continue**. The raw provider text stays in
+  Details and the Output channel.
+- **Repetition loops** are detected from the stream tail only (see above).
+  The default is to warn, not to stop silently.
 - **401/403** are never retried silently. External mode prompts once, stores
   the password in the secret store, and otherwise shows an "Enter password"
   banner.
@@ -324,11 +413,27 @@ the live structural endpoints. These UI behaviours still need a human:
 | "Still waiting for OpenCode…" | The model is slow or the provider is unreachable. Increase `responseTimeoutSeconds`, press Cancel, or check the Output channel. |
 | No assistant reply streams | OpenCode needs a reachable provider (API keys configured in OpenCode). |
 | Chat stays empty after reload | Check the Output channel; session history is restored from `/api/session/{id}/message`. |
+| Answer stops with an "incomplete" badge | The provider or connection failed mid-answer. Read the banner (it names the model/provider), then use **Retry**, **Switch model**, or **Continue**. |
+| Banner says the model is repeating itself | The provider is looping. **Stop** or **Stop and retry with a different model**; enable `autoStopRepetition` to stop automatically. |
+| Very long answers stop formatting | Expected above ~200,000 characters. Use **Show full output** to read the rest; the stream itself keeps working. |
+| Text looks garbled in a long reply | The provider sent a corrupted stream. The bridge forwards bytes exactly; retry, or switch models. |
 
 ## Development notes
 
 - `src/chatController.ts` contains all chat behaviour and has no `vscode`
-  import, so the send/prompt path is unit-tested with plain Node.
+  import, so the send/prompt path is unit-tested with plain Node. It posts
+  deltas only, deduplicates status messages, runs the repetition guard on the
+  tail, and classifies provider failures.
+- `src/repetition.ts` is the pure tail-only loop detector (char run >200,
+  short pattern ≥8 repeats and ≥160 covered characters). Only the last 400
+  characters are inspected.
+- `src/errors.ts` is the pure failure classifier (connection → auth → rate
+  limit → model → extension → unknown, in that priority).
+- `media/streamRender.cjs` is the pure incremental render state shared by the
+  webview (`window.OcStream`) and the Node tests: stable-block splitting,
+  open-tail tracking, the 200k cap, and the `requestAnimationFrame` scheduler.
+  Because the tests load the same module the webview loads, the render path
+  is exercised even though there is no DOM in CI.
 - `src/chatView.ts` is a thin adapter: HTML shell, strict nonce CSP, message
   forwarding, link opening.
 - `src/client.ts` uses raw `fetch` for the endpoints that differ from the
@@ -338,8 +443,15 @@ the live structural endpoints. These UI behaviours still need a human:
   (`OcMarkdown`, `OcSlash`) and the Node unit tests.
 - `test/fixtures/reasoning-tool-permission.json` is a recorded v2.3.0 event
   sequence (reasoning → tool → permission → final text) used by the reducer
-  tests; `test/slash.test.mjs` covers palette filtering and
-  `test/chatController.test.mjs` covers context math.
+  tests; `test/slash.test.mjs` covers palette filtering,
+  `test/chatController.test.mjs` covers context math,
+  `test/streaming.test.mjs` covers delta-only streaming, the 50,000-delta
+  budget, repetition banners and the recorded `ECONNRESET` replay,
+  `test/repetition.test.mjs` and `test/errors.test.mjs` cover the pure
+  detectors, and `test/streamRender.test.mjs` covers incremental rendering and
+  the 200k cap.
+- `npm test` currently reports **81 passing tests**; `npm run lint` reports
+  **0 problems**; `npm run compile` (tsc) is clean.
 - `npm run compile` only type-checks; the runtime artifact is the esbuild
   bundle in `out/extension.cjs`.
 

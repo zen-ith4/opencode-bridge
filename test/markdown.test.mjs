@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
 const md = require("../media/markdown.cjs");
@@ -37,16 +38,16 @@ test("renders every fenced block with its language and keeps surrounding text", 
   assert.ok(!html.includes("<p>print"), "second code block must not leak into a paragraph");
 });
 
-test("default code renderer escapes HTML and marks the language", () => {
+test("default code renderer escapes HTML, marks the language and forces LTR", () => {
   const html = md.renderMarkdown("```html\n<script>alert(1)</script>\n```");
-  assert.match(html, /<pre><code class="language-html">/);
+  assert.match(html, /<pre dir="ltr"><code class="language-html">/);
   assert.ok(html.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
   assert.ok(!html.includes("<script>"));
 });
 
 test("handles an unclosed fence", () => {
   const html = md.renderMarkdown("```js\nconst x = 1;");
-  assert.match(html, /<pre><code class="language-js">const x = 1;<\/code><\/pre>/);
+  assert.match(html, /<pre dir="ltr"><code class="language-js">const x = 1;<\/code><\/pre>/);
 });
 
 test("renders headings, lists and blockquotes", () => {
@@ -99,4 +100,53 @@ test("angle-bracket autolinks are not converted to anchors", () => {
   const html = md.renderMarkdown("<https://example.com>");
   assert.ok(!html.includes("<a "));
   assert.ok(html.includes("&lt;https://example.com&gt;"));
+});
+
+test("scheme checks also reject data: and protocol-relative links", () => {
+  const html = md.renderMarkdown(
+    "[data](data:text/html,<script>alert(1)</script>) [rel](//evil.example/x) [ok](HTTPS://EXAMPLE.COM)"
+  );
+  assert.ok(!html.includes('href="data:'));
+  assert.ok(!html.includes('href="//evil.example'));
+  assert.match(html, /<a href="HTTPS:\/\/EXAMPLE\.COM"/);
+});
+
+test("renders Persian headings, lists and tables without mangling the text", () => {
+  const input = [
+    "# داستان کوتاه",
+    "",
+    "## بخش نخست",
+    "",
+    "- پادشاه",
+    "- سه دختر",
+    "",
+    "1. سفر",
+    "2. بازگشت",
+    "",
+    "| نام | معنی |",
+    "| --- | --- |",
+    "| شب | night |",
+    "| ستاره | star |",
+  ].join("\n");
+  const html = md.renderMarkdown(input);
+  assert.ok(html.includes("<h1>داستان کوتاه</h1>"));
+  assert.ok(html.includes("<h2>بخش نخست</h2>"));
+  assert.ok(html.includes("<ul><li>پادشاه</li><li>سه دختر</li></ul>"));
+  assert.ok(html.includes("<ol><li>سفر</li><li>بازگشت</li></ol>"));
+  assert.ok(html.includes("<th>نام</th>"));
+  assert.ok(html.includes("<td>شب</td>"));
+  assert.ok(html.includes("<td>ستاره</td>"));
+});
+
+test("Persian code comments stay inside an LTR code block", () => {
+  const html = md.renderMarkdown(
+    ["```js", "// این یک توضیح فارسی است", "const x = 1;", "```"].join("\n")
+  );
+  assert.match(html, /<pre dir="ltr"><code class="language-js">/);
+  assert.ok(html.includes("// این یک توضیح فارسی است"));
+  assert.ok(!html.includes("<p>// این"));
+
+  const css = readFileSync(new URL("../media/webview.css", import.meta.url), "utf8");
+  assert.match(css, /\.code-pre\s*\{[^}]*direction:\s*ltr/s);
+  assert.match(css, /\.code-pre\s*\{[^}]*text-align:\s*left/s);
 });

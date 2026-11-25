@@ -50,6 +50,7 @@ interface Settings {
   debug: boolean;
   responseTimeoutSeconds: number;
   permissions: "ask" | "readOnlyAuto";
+  autoStopRepetition: boolean;
 }
 
 function getSettings(): Settings {
@@ -65,6 +66,7 @@ function getSettings(): Settings {
     debug: cfg.get<boolean>("debug", false),
     responseTimeoutSeconds: cfg.get<number>("responseTimeoutSeconds", 120),
     permissions: permissions === "readOnlyAuto" ? "readOnlyAuto" : "ask",
+    autoStopRepetition: cfg.get<boolean>("autoStopRepetition", false),
   };
 }
 
@@ -196,6 +198,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     mode: currentMode,
     getResponseTimeoutSeconds: () => getSettings().responseTimeoutSeconds,
     getPermissionsMode: () => getSettings().permissions,
+    getAutoStopRepetition: () => getSettings().autoStopRepetition,
     persistModel: (model) => {
       void context.globalState.update(SELECTED_MODEL_KEY, model);
     },
@@ -215,7 +218,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerConfigWatcher(context);
 
   // Exposed for debugging / tests (never contains the server password).
-  (globalThis as any).__opencodeBridge = {
+  (globalThis as unknown as Record<string, unknown>).__opencodeBridge = {
     client,
     getMode: () => currentMode,
     getSessionID: () => chatView?.getSessionID(),

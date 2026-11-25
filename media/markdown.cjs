@@ -38,7 +38,7 @@
 
   function defaultCodeBlock(lang, code) {
     var cls = lang ? ' class="language-' + escapeAttr(lang) + '"' : "";
-    return "<pre><code" + cls + ">" + escapeHtml(code) + "</code></pre>";
+    return '<pre dir="ltr"><code' + cls + ">" + escapeHtml(code) + "</code></pre>";
   }
 
   var TOKEN_PREFIX = "\u0000OCT";

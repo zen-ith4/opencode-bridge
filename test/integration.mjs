@@ -280,9 +280,12 @@ try {
   const appliedDeltas = posts.filter((message) => message.type === "assistant-delta");
 
   const expectedText = deltaEvents
-    .map((event) => event.data && typeof event.data.delta === "string" ? event.data.delta : "")
+    .map((event) => (event.data && typeof event.data.delta === "string" ? event.data.delta : ""))
     .join("");
-  const appliedText = appliedDeltas.length ? appliedDeltas.at(-1).text : "";
+  const appliedText = appliedDeltas.reduce(
+    (text, message) => (message.resync ? String(message.text || "") : text + String(message.delta || "")),
+    ""
+  );
   console.log(
     `DELTAS: events=${deltaEvents.length} unique-ids=${uniqueDeltaIDs.size} ` +
       `applied=${appliedDeltas.length} chars=${appliedText.length}`
@@ -294,6 +297,9 @@ try {
   if (deltaIDs.length !== uniqueDeltaIDs.size) fail("duplicate session.text.delta event ids were received");
   if (appliedDeltas.length > uniqueDeltaIDs.size) {
     fail("more assistant-delta messages were applied than unique delta events");
+  }
+  if (appliedDeltas.some((message) => !message.resync && message.text !== undefined)) {
+    fail("assistant-delta included the full accumulated text (O(n^2) stream)");
   }
   if (expectedText !== appliedText && deltaEvents.length > 0) {
     fail("streamed assistant text does not match the concatenated deltas");

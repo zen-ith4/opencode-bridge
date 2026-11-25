@@ -369,7 +369,7 @@ test("events for other sessions are ignored; own deltas are applied once", async
     const deltas = byType(posts, "assistant-delta");
     assert.equal(deltas.length, 1, "the same event id must not be applied twice");
     assert.equal(deltas[0].delta, "Hello");
-    assert.equal(deltas[0].text, "Hello");
+    assert.equal(deltas[0].text, undefined, "deltas must not repeat the accumulated text");
     assert.equal(byType(posts, "assistant-start").length, 1);
   } finally {
     controller.dispose();
@@ -557,7 +557,7 @@ test("recorded reasoning -> tool -> permission -> text sequence reduces correctl
     assert.equal(resolved[0].decision, "once");
 
     assert.equal(
-      byType(posts, "assistant-delta").at(-1).text,
+      byType(posts, "assistant-delta").at(-1).delta,
       "The .env file contains SECRET=topsecret."
     );
 

@@ -9,9 +9,14 @@
 
 import type { BridgeEvent, TextDelta } from "./events.js";
 import { extractTextDelta, shouldHandleEvent } from "./events.js";
+import { classifyFailure, isAbortLikeError, isProviderFailure } from "./errors.js";
+import type { FailureInfo } from "./errors.js";
+import { detectRepetition, describeRepetition } from "./repetition.js";
+import type { RepetitionHit } from "./repetition.js";
 import { logDebug, logError, logWarn } from "./log.js";
 import type {
   BridgeAgent,
+  BridgeAttachment,
   BridgeCommand,
   BridgeMessage,
   BridgeModel,
@@ -21,6 +26,7 @@ import type {
   FormInfo,
   PermissionDecision,
   PermissionRequest,
+  PromptFileInput,
   TokenUsage,
 } from "./client.js";
 
@@ -46,6 +52,7 @@ export interface ChatClientLike {
     sessionID: string;
     text: string;
     model?: ModelRef;
+    files?: PromptFileInput[];
   }): Promise<{ messageID: string }>;
   getProviders(): Promise<BridgeProviderLike[]>;
   getModels(): Promise<BridgeModelLike[]>;
@@ -99,7 +106,7 @@ interface StreamingTool {
   id: string;
   name: string;
   input: Record<string, unknown> | string;
-  status: "pending" | "running" | "done" | "failed";
+  status: "pending" | "running" | "done" | "failed" | "stopped";
   content?: Array<{ type: string; text?: string; [k: string]: unknown }>;
   metadata?: Record<string, unknown>;
   error?: string;
@@ -146,6 +153,48 @@ function stringArray(value: unknown): string[] {
   return value.filter((v): v is string => typeof v === "string" && v.length > 0);
 }
 
+/** Validate attachment descriptors posted by the webview. */
+function parseAttachments(value: unknown): BridgeAttachment[] {
+  if (!Array.isArray(value)) return [];
+  const out: BridgeAttachment[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    const obj = asRecord(raw);
+    if (!obj) continue;
+    const uri = stringValue(obj.uri);
+    const name = stringValue(obj.name) ?? (uri ? uri.split("/").pop() : undefined);
+    if (!uri || !name) continue;
+    if (seen.has(uri)) continue;
+    seen.add(uri);
+    out.push({
+      uri,
+      name,
+      ...(obj.kind === "file" ||
+      obj.kind === "folder" ||
+      obj.kind === "selection" ||
+      obj.kind === "current"
+        ? { kind: obj.kind }
+        : {}),
+      ...(typeof obj.mime === "string" ? { mime: obj.mime } : {}),
+      ...(typeof obj.size === "number" ? { size: obj.size } : {}),
+      ...(typeof obj.lines === "string" ? { lines: obj.lines } : {}),
+    });
+  }
+  return out;
+}
+
+/** Map UI attachments onto the server's `PromptInput.FileAttachment` shape. */
+function promptFiles(attachments: BridgeAttachment[]): PromptFileInput[] {
+  return attachments.map((attachment) => ({
+    uri: attachment.uri,
+    name: attachment.name,
+    ...(attachment.lines
+      ? { description: `${attachment.name} (lines ${attachment.lines})` }
+      : {}),
+    source: { type: "inline" as const },
+  }));
+}
+
 function toolContent(value: unknown): Array<{ type: string; text?: string; [k: string]: unknown }> {
   if (!Array.isArray(value)) return [];
   return value.map((c) => {
@@ -183,7 +232,18 @@ function structuredError(value: unknown): string {
   if (typeof value === "string") return value;
   const obj = asRecord(value);
   if (!obj) return String(value);
-  if (typeof obj.message === "string") return obj.message;
+  const nestedData = asRecord(obj.data);
+  const nestedError = asRecord(obj.error);
+  const candidates = [
+    obj.message,
+    nestedData?.message,
+    nestedError?.message,
+    obj.detail,
+    obj.reason,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+  }
   if (typeof obj.name === "string") return obj.name;
   try {
     return JSON.stringify(value);
@@ -306,6 +366,8 @@ export interface ChatControllerOptions {
   sessionID?: string;
   /** Configurable "still waiting" timeout (seconds). Default 120. */
   getResponseTimeoutSeconds?: () => number;
+  /** Automatically interrupt a detected repetition loop. Default false. */
+  getAutoStopRepetition?: () => boolean;
   persistModel?: (model: ModelRef | null) => void;
   persistSession?: (sessionID: string) => void;
   getPermissionsMode?: () => PermissionsMode;
@@ -319,6 +381,8 @@ export interface ChatControllerOptions {
 const DEFAULT_RESPONSE_TIMEOUT_SECONDS = 120;
 const MAX_SEEN_EVENT_IDS = 500;
 const MAX_UNKNOWN_EVENT_LOGS = 8;
+const CONTINUE_PROMPT =
+  "Continue from where you stopped. Do not repeat text you already wrote; start exactly at the cut-off point.";
 
 function errMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -374,10 +438,26 @@ export class ChatController {
   private generating = false;
   private stream: StreamingState = emptyStream();
   private lastPrompt: string | undefined;
+  private lastAttachments: BridgeAttachment[] = [];
   private undoStack: string[] = [];
   private userSeq = 0;
 
   private banner: ChatBanner | undefined;
+
+  /** Last status payload posted; keeps "thinking" from flooding the webview. */
+  private lastStatusKey = "";
+  /** Repetition detection runs at most once per this many new characters. */
+  private lastRepetitionCheck = 0;
+  private repetitionNotified = false;
+  private repetitionDismissed = false;
+  /** Set once a provider failure is reported for the current generation. */
+  private failureReported = false;
+  /**
+   * Sessions the user (this client) stopped, with the stop timestamp. Cleared
+   * when the next prompt starts. Late abort-style events for these sessions
+   * are neutral "Stopped", never a provider error banner.
+   */
+  private stoppedSessions = new Map<string, number>();
 
   private responseTimer: ReturnType<typeof setTimeout> | undefined;
   private disposed = false;
@@ -417,8 +497,10 @@ export class ChatController {
   /* Webview -> extension                                               */
   /* ------------------------------------------------------------------ */
 
-  async handleMessage(message: any): Promise<void> {
-    if (!message || typeof message.type !== "string") return;
+  async handleMessage(input: unknown): Promise<void> {
+    if (!input || typeof input !== "object") return;
+    const message = input as { type?: unknown } & Record<string, unknown>;
+    if (typeof message.type !== "string") return;
     try {
       switch (message.type) {
         case "ready":
@@ -426,7 +508,14 @@ export class ChatController {
           this.ensureEventStream();
           break;
         case "send":
-          await this.sendMessage(String(message.text ?? ""), message.context);
+          await this.sendMessage(
+            String(message.text ?? ""),
+            typeof message.context === "string" ? message.context : undefined,
+            parseAttachments(message.attachments)
+          );
+          break;
+        case "continue":
+          await this.continueGeneration();
           break;
         case "newChat":
           await this.newChat(typeof message.directory === "string" ? message.directory : undefined);
@@ -438,7 +527,7 @@ export class ChatController {
           await this.retry();
           break;
         case "selectModel":
-          await this.selectModel(message.model ?? null);
+          await this.selectModel((message.model ?? null) as ModelRef | null);
           break;
         case "selectAgent":
           await this.selectAgent(String(message.agent ?? ""));
@@ -448,7 +537,7 @@ export class ChatController {
           break;
         case "selectVariant":
           await this.selectVariant(
-            message.model ?? this.selectedModel,
+            (message.model ?? this.selectedModel) as ModelRef | null,
             typeof message.variant === "string" ? message.variant : undefined
           );
           break;
@@ -743,16 +832,15 @@ export class ChatController {
   /* Sending / sessions                                                 */
   /* ------------------------------------------------------------------ */
 
-  async sendMessage(text: string, context?: string): Promise<void> {
+  async sendMessage(
+    text: string,
+    context?: string,
+    attachments: BridgeAttachment[] = []
+  ): Promise<void> {
     const typed = text.trim();
-    if (!typed) return;
+    if (!typed && attachments.length === 0) return;
     if (this.generating) {
-      this.post({
-        type: "status",
-        status: "thinking",
-        message: "Still generating — press Stop first.",
-        generating: true,
-      });
+      this.postStatus("thinking", "Still generating — press Stop first.", true);
       return;
     }
 
@@ -762,15 +850,28 @@ export class ChatController {
       if (!this.currentSessionID) await this.createSession();
       if (!this.currentSessionID) return;
 
+      // A new prompt always starts from a clean stop/failure slate.
+      this.stoppedSessions.delete(this.currentSessionID);
+      this.failureReported = false;
+
       const userID = `user_${Date.now()}_${++this.userSeq}`;
       this.lastPrompt = fullText;
-      this.post({ type: "user-message", id: userID, text: fullText, created: Date.now() });
+      this.lastAttachments = attachments;
+      this.post({
+        type: "user-message",
+        id: userID,
+        text: fullText,
+        created: Date.now(),
+        ...(attachments.length > 0 ? { attachments } : {}),
+      });
 
       this.generating = true;
       this.stream = emptyStream();
       this.stream.agent = this.currentAgent;
       this.stream.model = this.selectedModel ?? undefined;
-      this.post({ type: "status", status: "thinking", message: "OpenCode is thinking…", generating: true });
+      this.resetStatusCache();
+      this.resetRepetitionGuard();
+      this.postStatus("thinking", "OpenCode is thinking…", true);
 
       if (this.selectedModel && this.client.setSessionModel) {
         try {
@@ -784,6 +885,7 @@ export class ChatController {
         sessionID: this.currentSessionID,
         text: fullText,
         model: this.selectedModel ?? undefined,
+        ...(attachments.length > 0 ? { files: promptFiles(attachments) } : {}),
       });
       this.startResponseTimer();
       this.debugLog("Prompt accepted; waiting for SSE events");
@@ -807,6 +909,7 @@ export class ChatController {
 
   async newChat(directory?: string): Promise<void> {
     this.finishStreaming();
+    this.resetRepetitionGuard();
     this.permissions.clear();
     this.forms.clear();
     this.contextUsed = 0;
@@ -835,7 +938,7 @@ export class ChatController {
       });
       this.postContext();
       void this.loadSessions();
-      this.post({ type: "status", status: "idle", message: "", generating: false });
+      this.postStatus("idle", "", false);
     } catch (err) {
       const message = errMessage(err);
       logError(`Failed to create chat: ${message}`);
@@ -866,6 +969,11 @@ export class ChatController {
   async stop(): Promise<void> {
     if (!this.generating) return;
     const sessionID = this.currentSessionID;
+    if (sessionID) this.rememberStopped(sessionID);
+    // Mark the partial answer neutral immediately; do not wait for the
+    // server's abort events (they arrive as step.failed afterwards).
+    this.markRunningToolsStopped();
+    this.finishStreaming("Stopped", { stopped: true });
     if (sessionID) {
       try {
         await this.client.interrupt(sessionID);
@@ -873,7 +981,49 @@ export class ChatController {
         logError(`Failed to interrupt session: ${errMessage(err)}`);
       }
     }
-    this.finishStreaming("Stopped");
+    void this.loadSessions();
+  }
+
+  /** Remember a user-initiated stop until the next prompt in that session. */
+  private rememberStopped(sessionID: string): void {
+    this.stoppedSessions.set(sessionID, Date.now());
+    while (this.stoppedSessions.size > 50) {
+      const oldest = this.stoppedSessions.keys().next().value;
+      if (!oldest) break;
+      this.stoppedSessions.delete(oldest);
+    }
+  }
+
+  /** A stop from this client (or any abort-shaped event) for the session. */
+  private isStopLike(raw: unknown, sessionID?: string): boolean {
+    const sid = sessionID ?? this.currentSessionID;
+    return (!!sid && this.stoppedSessions.has(sid)) || isAbortLikeError(raw);
+  }
+
+  /** Flip running/pending tool rows to "stopped" (no error styling). */
+  private markRunningToolsStopped(): void {
+    for (const tool of this.stream.tools.values()) {
+      if (tool.status !== "running" && tool.status !== "pending") continue;
+      tool.status = "stopped";
+      this.post({
+        type: "tool-update",
+        messageID: this.stream.messageID,
+        tool: this.serializeTool(tool),
+      });
+    }
+  }
+
+  /**
+   * End the turn as a neutral "Stopped": keep partial text, no banner and no
+   * prompt-failed bubble. Used for our Stop button, abort-style failures and
+   * `session.execution.interrupted` (which may come from another client).
+   */
+  private neutralStop(sessionID?: string, note = "Stopped"): void {
+    const sid = sessionID ?? this.currentSessionID;
+    if (sid) this.rememberStopped(sid);
+    this.markRunningToolsStopped();
+    this.finishStreaming(note, { stopped: true });
+    void this.loadSessions();
   }
 
   async retry(): Promise<void> {
@@ -890,12 +1040,19 @@ export class ChatController {
     this.stream = emptyStream();
     this.stream.agent = this.currentAgent;
     this.stream.model = this.selectedModel ?? undefined;
-    this.post({ type: "status", status: "thinking", message: "Retrying…", generating: true });
+    this.stoppedSessions.delete(this.currentSessionID);
+    this.failureReported = false;
+    this.resetStatusCache();
+    this.resetRepetitionGuard();
+    this.postStatus("thinking", "Retrying…", true);
     try {
       await this.client.prompt({
         sessionID: this.currentSessionID,
         text: this.lastPrompt,
         model: this.selectedModel ?? undefined,
+        ...(this.lastAttachments.length > 0
+          ? { files: promptFiles(this.lastAttachments) }
+          : {}),
       });
       this.startResponseTimer();
     } catch (err) {
@@ -1024,6 +1181,7 @@ export class ChatController {
   async switchSession(sessionID: string): Promise<void> {
     if (!sessionID || sessionID === this.currentSessionID) return;
     this.finishStreaming();
+    this.resetRepetitionGuard();
     this.permissions.clear();
     this.forms.clear();
     this.currentSessionID = sessionID;
@@ -1200,12 +1358,9 @@ export class ChatController {
       if (!this.currentSessionID) return;
       this.generating = true;
       this.stream = emptyStream();
-      this.post({
-        type: "status",
-        status: "thinking",
-        message: `Running /${name}…`,
-        generating: true,
-      });
+      this.resetStatusCache();
+      this.resetRepetitionGuard();
+      this.postStatus("thinking", `Running /${name}…`, true);
       if (this.client.runCommand) {
         await this.client.runCommand(this.currentSessionID, name, args);
       } else {
@@ -1293,6 +1448,21 @@ export class ChatController {
       case "cancel-wait":
         await this.stop();
         break;
+      case "stop":
+        await this.stop();
+        break;
+      case "stop-retry-model":
+        await this.stop();
+        this.clearBanner();
+        this.post({ type: "open-model-picker" });
+        break;
+      case "switch-model":
+        this.post({ type: "open-model-picker" });
+        break;
+      case "dismiss-repetition":
+        this.repetitionDismissed = true;
+        this.clearBanner();
+        break;
       case "dismiss":
         this.clearBanner();
         break;
@@ -1317,13 +1487,12 @@ export class ChatController {
     this.responseTimer = setTimeout(() => {
       this.responseTimer = undefined;
       if (!this.generating || this.disposed) return;
-      this.post({
-        type: "status",
-        status: "waiting",
-        message: `Still waiting for OpenCode… (no events for ${Math.round(seconds)}s)`,
-        generating: true,
-        canCancel: true,
-      });
+      this.postStatus(
+        "waiting",
+        `Still waiting for OpenCode… (no events for ${Math.round(seconds)}s)`,
+        true,
+        true
+      );
     }, seconds * 1_000);
   }
 
@@ -1338,11 +1507,197 @@ export class ChatController {
     if (this.generating) this.startResponseTimer();
   }
 
-  private finishStreaming(message?: string): void {
+  /* ------------------------------------------------------------------ */
+  /* Status (deduplicated) / runaway output                             */
+  /* ------------------------------------------------------------------ */
+
+  private resetStatusCache(): void {
+    this.lastStatusKey = "";
+  }
+
+  /**
+   * Post a status only when it actually changes. `session.text.delta` used
+   * to send an identical "thinking" status for every chunk.
+   */
+  private postStatus(
+    status: string,
+    message: string,
+    generating: boolean,
+    canCancel = false
+  ): void {
+    const key = `${status}\u0001${message}\u0001${generating ? "1" : "0"}\u0001${
+      canCancel ? "1" : "0"
+    }`;
+    if (key === this.lastStatusKey) return;
+    this.lastStatusKey = key;
+    this.post({ type: "status", status, message, generating, canCancel });
+  }
+
+  private resetRepetitionGuard(): void {
+    this.lastRepetitionCheck = 0;
+    this.repetitionNotified = false;
+    this.repetitionDismissed = false;
+    this.failureReported = false;
+  }
+
+  /**
+   * Check the streamed tail for degenerate loops. Runs on the tail only and
+   * at most once per ~128 new characters, so a 250k-character stream costs
+   * a handful of tiny regex/slice operations.
+   */
+  private maybeCheckRepetition(): void {
+    if (!this.generating || this.repetitionNotified || this.repetitionDismissed) return;
+    const text = this.stream.text;
+    if (text.length < 160) return;
+    if (text.length - this.lastRepetitionCheck < 128) return;
+    this.lastRepetitionCheck = text.length;
+
+    const hit = detectRepetition(text);
+    if (!hit) return;
+
+    this.repetitionNotified = true;
+    const autoStop = this.opts.getAutoStopRepetition?.() === true;
+    this.debugLog(
+      `repetition detected: ${hit.kind} ${hit.length} chars${
+        autoStop ? " (auto-stopping)" : ""
+      }`
+    );
+    this.showRepetitionBanner(hit, autoStop);
+    if (autoStop) {
+      void this.stop().then(() => this.showRepetitionBanner(hit, true));
+    }
+  }
+
+  private modelLabel(): string {
+    const model = this.stream.model ?? this.selectedModel;
+    return model ? formatModelRef(model) : "The selected model";
+  }
+
+  private showRepetitionBanner(hit: RepetitionHit, autoStopped: boolean): void {
+    this.showBanner({
+      kind: "warning",
+      message: `${this.modelLabel()}: The model seems stuck in a repetition loop.`,
+      details:
+        `${describeRepetition(hit)}.` +
+        (autoStopped
+          ? "\nStopped automatically because opencodeBridge.autoStopRepetition is enabled."
+          : ""),
+      source: "runtime",
+      actions: autoStopped
+        ? [
+            { id: "switch-model", label: "Switch model" },
+            { id: "dismiss-repetition", label: "Dismiss" },
+          ]
+        : [
+            { id: "stop", label: "Stop" },
+            { id: "stop-retry-model", label: "Stop and retry with a different model" },
+            { id: "dismiss-repetition", label: "Dismiss" },
+          ],
+    });
+  }
+
+  /**
+   * Continue an interrupted/failed answer. The partial assistant text is
+   * still in the server-side message history, so a plain follow-up is enough.
+   */
+  async continueGeneration(): Promise<void> {
+    if (this.generating) return;
+    await this.sendMessage(CONTINUE_PROMPT);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Provider failure banners                                           */
+  /* ------------------------------------------------------------------ */
+
+  private failureActions(info: FailureInfo): BannerAction[] {
+    const actions: BannerAction[] = [];
+    if (info.kind === "auth") actions.push({ id: "enter-password", label: "Enter password" });
+    if (info.retryable) actions.push({ id: "retry-prompt", label: "Retry" });
+    actions.push({ id: "switch-model", label: "Switch model" });
+    actions.push({ id: "open-logs", label: "Open logs" });
+    return actions;
+  }
+
+  private failureDetails(info: FailureInfo, model?: ModelRef): string {
+    const ref = model ?? this.stream.model ?? this.selectedModel;
+    const provider = ref?.providerID ?? "unknown provider";
+    const label = ref ? formatModelRef(ref) : "The selected model";
+    return `Model: ${label}\nProvider: ${provider}\n\n${info.details}`;
+  }
+
+  /**
+   * Show a model/provider-aware banner for execution/step failures, keep the
+   * partial text, and mark the assistant message as incomplete.
+   */
+  private showExecutionFailure(raw: unknown, markIncomplete: boolean): void {
+    // An abort is a user-visible "Stopped", not a provider failure. This also
+    // covers interrupts initiated by another client.
+    if (this.isStopLike(raw)) {
+      const sid = this.currentSessionID;
+      this.neutralStop(sid);
+      return;
+    }
+    // OpenCode can report the same terminal failure as both step.failed and
+    // execution.failed; only the first should produce a banner.
+    if (this.failureReported) return;
+    this.failureReported = true;
+    const info = classifyFailure(raw);
+    // Capture the assistant message's model before finishStreaming resets it.
+    const failedModel = this.stream.model ?? this.selectedModel ?? undefined;
+    const modelLabel = failedModel ? formatModelRef(failedModel) : "The selected model";
+    const details = this.failureDetails(info, failedModel);
+    if (markIncomplete) {
+      this.finishStreaming(undefined, { incomplete: true, reason: info.summary });
+    } else {
+      this.finishStreaming();
+    }
+    logError(`OpenCode ${info.label} (${modelLabel}): ${info.details}`);
+    this.post({
+      type: "prompt-failed",
+      message: `${modelLabel}: ${info.summary}`,
+      details: info.details,
+    });
+    this.showBanner({
+      kind:
+        info.kind === "auth" ? "auth" : info.kind === "rate-limit" ? "warning" : "error",
+      message: `${modelLabel}: ${info.summary}`,
+      details,
+      source: "runtime",
+      actions: this.failureActions(info),
+    });
+  }
+
+  /**
+   * Tool failures are normally shown inline in the tool card. Only surface a
+   * top banner when the tool failure is really a provider/transport failure.
+   */
+  private showToolFailure(raw: unknown, toolName: string): void {
+    const info = classifyFailure(raw);
+    if (!isProviderFailure(info.kind)) return;
+    const modelLabel = this.modelLabel();
+    this.showBanner({
+      kind: info.kind === "auth" ? "auth" : "error",
+      message: `${modelLabel}: tool "${toolName}" failed. ${info.summary}`,
+      details: this.failureDetails(info),
+      source: "runtime",
+      actions: this.failureActions(info),
+    });
+  }
+
+  private finishStreaming(
+    message?: string,
+    options?: { incomplete?: boolean; reason?: string; stopped?: boolean }
+  ): void {
     this.stopResponseTimer();
     const messageID = this.stream.messageID;
     if (messageID) {
-      this.post({ type: "assistant-end", messageID });
+      this.post({
+        type: "assistant-end",
+        messageID,
+        ...(options?.incomplete ? { incomplete: true } : {}),
+        ...(options?.reason ? { reason: options.reason } : {}),
+        ...(options?.stopped ? { stopped: true } : {}),
+      });
     }
     const files = [...this.stream.files.values()];
     if (files.length > 0) {
@@ -1359,13 +1714,7 @@ export class ChatController {
     }
     this.stream = emptyStream();
     this.generating = false;
-    this.post({
-      type: "status",
-      status: "idle",
-      message: message ?? "",
-      generating: false,
-      canCancel: false,
-    });
+    this.postStatus("idle", message ?? "", false);
   }
 
   /* ------------------------------------------------------------------ */
@@ -1539,7 +1888,7 @@ export class ChatController {
       /* ---------------------------------------------------------- */
       case "session.text.started": {
         this.ensureAssistant(stringValue(data?.assistantMessageID), event.sessionID);
-        this.post({ type: "status", status: "thinking", message: "", generating: true });
+        this.postStatus("thinking", "", true);
         return;
       }
 
@@ -1548,13 +1897,15 @@ export class ChatController {
         if (!part) return;
         this.ensureAssistant(part.messageID, part.sessionID);
         this.stream.text += part.text;
+        // Post only the new chunk. The webview accumulates. Sending the full
+        // accumulated text here made every delta O(n) and the stream O(n^2).
         this.post({
           type: "assistant-delta",
           messageID: this.stream.messageID,
           delta: part.text,
-          text: this.stream.text,
         });
-        this.post({ type: "status", status: "thinking", message: "", generating: true });
+        this.postStatus("thinking", "", true);
+        this.maybeCheckRepetition();
         return;
       }
 
@@ -1564,12 +1915,14 @@ export class ChatController {
         this.ensureAssistant(messageID, event.sessionID);
         if (fullText && fullText !== this.stream.text) {
           // Correct the stream if a delta was missed (e.g. during reconnect).
+          // `resync` tells the webview to replace, not append.
           this.stream.text = fullText;
           this.post({
             type: "assistant-delta",
             messageID: this.stream.messageID,
-            delta: fullText,
+            delta: "",
             text: fullText,
+            resync: true,
           });
         }
         // Do not mark idle here: v2.3.0 emits step.ended and execution.*
@@ -1718,11 +2071,16 @@ export class ChatController {
         tool.status = "failed";
         tool.content = toolContent(data?.content);
         tool.error = structuredError(data?.error) || "Tool failed";
+        if (this.isStopLike(data?.error ?? tool.error, event.sessionID)) {
+          tool.status = "stopped";
+          tool.error = undefined;
+        }
         this.post({
           type: "tool-update",
           messageID: this.stream.messageID,
           tool: this.serializeTool(tool),
         });
+        if (tool.status !== "stopped") this.showToolFailure(tool.error, tool.name);
         return;
       }
 
@@ -1757,19 +2115,12 @@ export class ChatController {
           });
         }
         if (event.type === "session.step.failed") {
-          const message = structuredError(data?.error) || "The model step failed";
-          this.finishStreaming();
-          this.post({ type: "prompt-failed", message, details: message });
-          this.showBanner({
-            kind: "error",
-            message: "OpenCode could not complete the request.",
-            details: message,
-            source: "runtime",
-            actions: [
-              { id: "retry-prompt", label: "Retry" },
-              { id: "open-logs", label: "Open logs" },
-            ],
-          });
+          const rawError = data?.error ?? "The model step failed";
+          if (this.isStopLike(rawError, event.sessionID)) {
+            this.neutralStop(event.sessionID);
+          } else {
+            this.showExecutionFailure(rawError, true);
+          }
         }
         return;
       }
@@ -1785,7 +2136,7 @@ export class ChatController {
       case "session.execution.started": {
         if (!this.generating) {
           this.generating = true;
-          this.post({ type: "status", status: "thinking", message: "", generating: true });
+          this.postStatus("thinking", "", true);
         }
         this.startResponseTimer();
         this.postSessions();
@@ -1798,12 +2149,12 @@ export class ChatController {
         if (type === "busy") {
           if (!this.generating) {
             this.generating = true;
-            this.post({ type: "status", status: "thinking", message: "", generating: true });
+            this.postStatus("thinking", "", true);
           }
           this.postSessions();
         } else if (type === "retry") {
           const message = stringValue(status?.message) ?? "Retrying…";
-          this.post({ type: "status", status: "waiting", message, generating: true });
+          this.postStatus("waiting", message, true);
         } else {
           this.finishStreaming();
           void this.loadSessions();
@@ -1812,28 +2163,24 @@ export class ChatController {
       }
 
       case "session.execution.succeeded":
-      case "session.execution.interrupted":
       case "session.idle":
         this.finishStreaming();
         void this.loadSessions();
         return;
 
+      case "session.execution.interrupted":
+        // May originate from our Stop button or another client. Either way it
+        // is a neutral stop, never an error.
+        this.neutralStop(event.sessionID);
+        return;
+
       case "session.execution.failed": {
         const errorObj = data?.error ?? data;
-        const message = this.structuredErrorMessage(errorObj);
-        logError(`OpenCode execution failed: ${message}`);
-        this.finishStreaming();
-        this.post({ type: "prompt-failed", message, details: message });
-        this.showBanner({
-          kind: "error",
-          message: "OpenCode could not complete the request.",
-          details: message,
-          source: "runtime",
-          actions: [
-            { id: "retry-prompt", label: "Retry" },
-            { id: "open-logs", label: "Open logs" },
-          ],
-        });
+        if (this.isStopLike(errorObj, event.sessionID)) {
+          this.neutralStop(event.sessionID);
+          return;
+        }
+        this.showExecutionFailure(errorObj, true);
         return;
       }
 
@@ -2088,7 +2435,18 @@ export class ChatController {
     if (typeof value === "string") return value;
     if (typeof value === "object") {
       const obj = value as Record<string, unknown>;
-      if (typeof obj.message === "string") return obj.message;
+      const nestedData = asRecord(obj.data);
+      const nestedError = asRecord(obj.error);
+      const candidates = [
+        obj.message,
+        nestedData?.message,
+        nestedError?.message,
+        obj.detail,
+        obj.reason,
+      ];
+      for (const candidate of candidates) {
+        if (typeof candidate === "string" && candidate.trim()) return candidate;
+      }
       if (typeof obj.name === "string") return obj.name;
       try {
         return JSON.stringify(value);

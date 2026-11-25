@@ -162,6 +162,17 @@ test("P0: provider message handler drives ready -> init and send -> prompt", asy
     const webviewSource = await readFile(new URL("../media/webview.js", import.meta.url), "utf8");
     assert.match(webviewSource, /acquireVsCodeApi\(\)/);
     assert.ok(!webviewSource.includes("parent.postMessage"));
+    assert.match(fake.view.webview.html, /streamRender\.cjs/, "incremental renderer must load");
+    const streamRenderSource = await readFile(
+      new URL("../media/streamRender.cjs", import.meta.url),
+      "utf8"
+    );
+    assert.match(streamRenderSource, /OcStream/);
+    assert.match(streamRenderSource, /DEFAULT_CAP = 200000/);
+    assert.match(webviewSource, /outPre\.dir = "ltr"/, "tool output must be LTR");
+    assert.match(webviewSource, /applyAssistantDelta/, "deltas must be accumulated incrementally");
+    const cssSource = await readFile(new URL("../media/webview.css", import.meta.url), "utf8");
+    assert.match(cssSource, /\.tool-pre\s*\{[^}]*direction:\s*ltr/s);
 
     // Exactly what the webview posts after acquireVsCodeApi() is available.
     fake.send({ type: "ready" });

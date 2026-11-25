@@ -119,6 +119,30 @@ export interface MessageTextPart {
 
 export type MessagePart = MessageTextPart | MessageReasoningPart | MessageToolPart;
 
+/**
+ * A user attachment as shown in the composer/history. The extension host owns
+ * reading metadata; the webview only ever sees this descriptor.
+ */
+export interface BridgeAttachment {
+  /** Absolute `file://` URI understood by the server. */
+  uri: string;
+  name: string;
+  /** `file` for a workspace/desktop file, `folder` for a directory. */
+  kind?: "file" | "folder" | "selection" | "current";
+  mime?: string;
+  size?: number;
+  /** Human-readable line range, e.g. `12-20` (collected from the editor). */
+  lines?: string;
+}
+
+/** `PromptInput.FileAttachment` (uri + optional inline/uri source). */
+export interface PromptFileInput {
+  uri: string;
+  name?: string;
+  description?: string;
+  source?: { type: "inline" } | { type: "uri"; uri: string };
+}
+
 /** A user or assistant message restored from GET /api/session/{id}/message. */
 export interface BridgeMessage {
   id: string;
@@ -129,7 +153,10 @@ export interface BridgeMessage {
   parts?: MessagePart[];
   agent?: string;
   model?: ModelRef;
+  /** Files the assistant changed (assistant messages only). */
   files?: string[];
+  /** Attachments the user sent with this message. */
+  attachments?: BridgeAttachment[];
   cost?: number;
   tokens?: TokenUsage;
 }
@@ -236,6 +263,7 @@ interface PromptOptions {
   sessionID: string;
   text: string;
   model?: ModelRef;
+  files?: PromptFileInput[];
 }
 
 /** Truncate a server response snippet for error messages. */
@@ -368,7 +396,7 @@ export class OpencodeBridgeClient {
   private async fetchJSON(
     path: string,
     options: { method?: string; headers?: Record<string, string>; body?: unknown } = {}
-  ): Promise<any> {
+  ): Promise<unknown> {
     const url = this.baseUrl + path; // baseUrl already includes /api
     const headers: Record<string, string> = {};
     if (this.authHeader) headers.Authorization = this.authHeader;
@@ -402,7 +430,7 @@ export class OpencodeBridgeClient {
     path: string,
     options: { method?: string; headers?: Record<string, string>; body?: unknown } = {},
     maxMs = 10_000
-  ): Promise<any> {
+  ): Promise<unknown> {
     const deadline = Date.now() + maxMs;
     let lastErr: unknown = null;
     let delay = 500;
@@ -508,6 +536,7 @@ export class OpencodeBridgeClient {
       // controller switches the session model first (POST /session/{id}/model).
       this.debugLog(`Sending prompt to session ${opts.sessionID} (${opts.text.length} chars)`);
       const body: Record<string, unknown> = { text: opts.text };
+      if (opts.files && opts.files.length > 0) body.files = opts.files;
       const resp = await this.fetchJSON(`/session/${encodeURIComponent(opts.sessionID)}/prompt`, {
         method: "POST",
         body,
@@ -702,7 +731,37 @@ export class OpencodeBridgeClient {
             : undefined;
 
         if (type === "user") {
-          messages.push({ id: String(obj.id ?? ""), role: "user", text: String(obj.text ?? ""), created });
+          const payload =
+            obj.payload && typeof obj.payload === "object"
+              ? (obj.payload as Record<string, unknown>)
+              : obj;
+          const attachments: BridgeAttachment[] = [];
+          const rawFiles = Array.isArray(payload.files) ? payload.files : [];
+          for (const raw of rawFiles) {
+            const file = raw as Record<string, unknown>;
+            const source =
+              file.source && typeof file.source === "object"
+                ? (file.source as Record<string, unknown>)
+                : {};
+            const uri = typeof source.uri === "string" ? source.uri : "";
+            const name =
+              typeof file.name === "string" && file.name
+                ? file.name
+                : uri.split("/").pop() || "attachment";
+            if (!uri && !name) continue;
+            attachments.push({
+              uri,
+              name,
+              ...(typeof file.mime === "string" ? { mime: file.mime } : {}),
+            });
+          }
+          messages.push({
+            id: String(obj.id ?? ""),
+            role: "user",
+            text: String(obj.text ?? payload.text ?? ""),
+            created,
+            ...(attachments.length > 0 ? { attachments } : {}),
+          });
           continue;
         }
 
