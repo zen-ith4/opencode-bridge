@@ -113,6 +113,12 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
     });
     this.viewDisposables.push(visibilityDisposable);
 
+    this.viewDisposables.push(
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration("opencodeBridge.ui")) this.postUiSettings();
+      })
+    );
+
     // The webview sends {"type":"ready"} once acquireVsCodeApi() is in place;
     // that is what triggers the init payload (models + history + banner) and
     // the single SSE subscription (see ChatController.handleMessage).
@@ -151,6 +157,25 @@ export class OpenCodeChatView implements vscode.WebviewViewProvider {
     if (await this.handleAttachmentMessage(message)) return;
 
     await this.controller.handleMessage(message);
+    // The webview is ready to receive settings once it has said hello.
+    if (message.type === "ready") this.postUiSettings();
+  }
+
+  /** Visual preferences (`opencodeBridge.ui.*`) for the webview. */
+  private uiSettings(): Record<string, unknown> {
+    const cfg = vscode.workspace.getConfiguration("opencodeBridge.ui");
+    const dir = cfg.get<string>("textDirection", "auto");
+    return {
+      textDirection: dir === "ltr" || dir === "rtl" ? dir : "auto",
+      fontFamily: cfg.get<string>("fontFamily", ""),
+      fontSize: cfg.get<number>("fontSize", 0),
+      modelLabelMaxWidth: cfg.get<number>("modelLabelMaxWidth", 160),
+      showToolControls: cfg.get<boolean>("showToolControls", true),
+    };
+  }
+
+  private postUiSettings(): void {
+    this.postToWebview({ type: "ui-settings", settings: this.uiSettings() });
   }
 
   /* ------------------------------------------------------------------ */

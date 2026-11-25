@@ -58,6 +58,8 @@ export interface ChatClientLike {
   getModels(): Promise<BridgeModelLike[]>;
   getMessages(sessionID: string): Promise<BridgeMessageLike[]>;
   interrupt(sessionID: string): Promise<void>;
+  /** Optional: detach blocking work (subagents) and keep it running. */
+  backgroundSession?(sessionID: string): Promise<boolean>;
   streamEvents(opts: {
     signal: AbortSignal;
     onEvent: (event: BridgeEvent) => void;
@@ -523,6 +525,9 @@ export class ChatController {
         case "stop":
           await this.stop();
           break;
+        case "background":
+          await this.backgroundRunning();
+          break;
         case "retry":
           await this.retry();
           break;
@@ -966,22 +971,89 @@ export class ChatController {
     return session;
   }
 
+  /** True while a tool call (for example a shell command) is still running. */
+  private hasRunningTools(): boolean {
+    for (const tool of this.stream.tools.values()) {
+      if (tool.status === "running" || tool.status === "pending") return true;
+    }
+    return false;
+  }
+
   async stop(): Promise<void> {
-    if (!this.generating) return;
+    // A shell command can outlive the visible "generating" state, so a
+    // running tool is a reason to stop even when the turn looks finished.
+    if (!this.generating && !this.hasRunningTools()) return;
     const sessionID = this.currentSessionID;
     if (sessionID) this.rememberStopped(sessionID);
     // Mark the partial answer neutral immediately; do not wait for the
     // server's abort events (they arrive as step.failed afterwards).
     this.markRunningToolsStopped();
     this.finishStreaming("Stopped", { stopped: true });
-    if (sessionID) {
-      try {
-        await this.client.interrupt(sessionID);
-      } catch (err) {
-        logError(`Failed to interrupt session: ${errMessage(err)}`);
-      }
-    }
+    if (sessionID) await this.interruptSession(sessionID);
     void this.loadSessions();
+  }
+
+  /**
+   * Interrupt the server-side run. A failure is reported honestly: the UI
+   * already says "Stopped", but the command may still be running, so the user
+   * gets a banner with a retry instead of a silent log line.
+   */
+  private async interruptSession(sessionID: string): Promise<boolean> {
+    try {
+      await this.client.interrupt(sessionID);
+      if (this.banner?.actions?.some((a) => a.id === "retry-stop")) this.clearBanner();
+      return true;
+    } catch (err) {
+      const message = errMessage(err);
+      logError(`Failed to interrupt session: ${message}`);
+      this.showBanner({
+        kind: "error",
+        message:
+          "OpenCode did not confirm the stop. A running command may still be going.",
+        details: message,
+        source: "runtime",
+        actions: [
+          { id: "retry-stop", label: "Try stopping again" },
+          { id: "open-logs", label: "Open logs" },
+        ],
+      });
+      return false;
+    }
+  }
+
+  /**
+   * "Run in background": ask the server to detach the work the turn is
+   * blocked on. The server only reports whether something was detached, so
+   * the answer is relayed as-is instead of claiming a shell was moved.
+   */
+  async backgroundRunning(): Promise<void> {
+    const sessionID = this.currentSessionID;
+    if (!sessionID || (!this.generating && !this.hasRunningTools())) {
+      this.post({ type: "note", kind: "info", text: "Nothing is running to move to the background." });
+      return;
+    }
+    if (!this.client.backgroundSession) {
+      this.post({
+        type: "note",
+        kind: "warning",
+        text: "This OpenCode server cannot move work to the background. Use Stop to end it.",
+      });
+      return;
+    }
+    try {
+      const moved = await this.client.backgroundSession(sessionID);
+      this.post({
+        type: "note",
+        kind: moved ? "info" : "warning",
+        text: moved
+          ? "Moved the blocking work to the background. The chat keeps going."
+          : "OpenCode had nothing to detach (it only moves subagents, not plain shell commands). Use Stop to end the command.",
+      });
+    } catch (err) {
+      const message = errMessage(err);
+      logError(`Failed to background session: ${message}`);
+      this.post({ type: "note", kind: "error", text: message });
+    }
   }
 
   /** Remember a user-initiated stop until the next prompt in that session. */
@@ -1450,6 +1522,9 @@ export class ChatController {
         break;
       case "stop":
         await this.stop();
+        break;
+      case "retry-stop":
+        if (this.currentSessionID) await this.interruptSession(this.currentSessionID);
         break;
       case "stop-retry-model":
         await this.stop();

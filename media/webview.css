@@ -473,6 +473,32 @@ summary:focus-visible {
   word-break: break-word;
 }
 
+/* Persian / Arabic / Hebrew: every block picks its own direction from its
+   first strong character, so a Persian paragraph is right-aligned and an
+   English code comment next to it stays left-aligned. Code stays LTR. */
+body:not([data-text-dir="ltr"]):not([data-text-dir="rtl"]) .msg-body :is(p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary) {
+  unicode-bidi: plaintext;
+  text-align: start;
+}
+
+body[data-text-dir="rtl"] .msg-body {
+  direction: rtl;
+  text-align: right;
+}
+
+body[data-text-dir="ltr"] .msg-body {
+  direction: ltr;
+  text-align: left;
+}
+
+.msg-body pre,
+.msg-body code,
+.tool-body {
+  direction: ltr;
+  unicode-bidi: isolate;
+  text-align: left;
+}
+
 .msg-time {
   display: block;
   margin-top: 2px;
@@ -868,7 +894,9 @@ summary:focus-visible {
   position: absolute;
   z-index: 20;
   right: 12px;
-  bottom: 96px;
+  /* Set from JS (updateJumpOffset) so it always sits just above the status
+     line and composer, whatever height they have. */
+  bottom: var(--oc-jump-bottom, 96px);
   padding: 4px 9px;
   border: 1px solid var(--oc-border);
   border-radius: 12px;
@@ -1775,6 +1803,10 @@ body.vscode-high-contrast .model-item[aria-selected="true"] {
 .composer {
   display: flex;
   flex-direction: column;
+  /* The earlier row-layout rule set align-items:flex-end; in a column that
+     made the card shrink-to-fit and spill off the left edge when the toolbar
+     (long model name) was wider than the panel. */
+  align-items: stretch;
   gap: 4px;
   padding: 6px 8px 8px;
   border-top: 1px solid var(--oc-border);
@@ -1876,7 +1908,7 @@ body.vscode-high-contrast .model-item[aria-selected="true"] {
 }
 
 .toolbar-label {
-  max-width: 120px;
+  max-width: var(--oc-model-label-max, 160px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2408,3 +2440,61 @@ body.vscode-high-contrast .send-btn {
   border-color: var(--vscode-contrastBorder, var(--oc-border));
 }
 
+
+
+/* ------------------------------------------------------------------ */
+/* Running tool controls (Stop / Run in background)                   */
+/* ------------------------------------------------------------------ */
+
+.tool-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 8px 6px;
+  border-top: 1px solid var(--oc-border);
+}
+
+.tool-actions[hidden] {
+  display: none;
+}
+
+.tool-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--oc-border);
+  border-radius: 4px;
+  background: var(--oc-hover);
+  color: var(--oc-fg);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tool-action:hover:not(:disabled) {
+  background: var(--vscode-toolbar-hoverBackground, var(--oc-hover));
+}
+
+.tool-action:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.tool-action-stop {
+  border-color: var(--oc-error);
+  color: var(--oc-error);
+}
+
+/* When the toolbar is tight, the (long) model name gives way first; agent,
+   thinking level, context ring and send button keep their natural width. */
+#btnModel {
+  flex: 0 1 auto;
+}
+
+#btnAttach,
+#btnAgent,
+#btnThinking,
+.context-ring,
+.send-btn {
+  flex: 0 0 auto;
+}

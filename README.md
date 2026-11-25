@@ -251,6 +251,13 @@ result and says that no reply was received.
 | `debug` | `false` | Verbose lines in the Output channel. |
 | `permissions` | `"ask"` | `"ask"` shows a card for every permission request. `"readOnlyAuto"` auto-replies `"once"` to read-only requests only. |
 | `autoStopRepetition` | `false` | Stop generation automatically when a degenerate repetition loop is detected. When `false`, a banner offers Stop / switch model / Dismiss. |
+| `ui.textDirection` | `auto` | `auto`, `ltr` or `rtl`. With `auto`, each paragraph picks its own direction, so Persian/Arabic text is right-aligned and English stays left-aligned. |
+| `ui.fontFamily` | `""` | Chat font (for example `Vazirmatn, Tahoma, sans-serif`). Empty uses the editor UI font. |
+| `ui.fontSize` | `0` | Chat font size in px (8-32). `0` uses the editor font size. |
+| `ui.modelLabelMaxWidth` | `160` | Widest the model name may get in the composer toolbar (60-400 px) before it is cut with an ellipsis. |
+| `ui.showToolControls` | `true` | Show **Stop** and **Run in background** buttons on a running tool call such as a shell command. |
+
+**Stopping and backgrounding a running command.** The **Stop** button on a running tool card interrupts the turn (and the command it is waiting on). If the server rejects the interrupt, a banner says so and offers **Try stopping again** instead of pretending it worked. **Run in background** asks OpenCode to detach blocking work; the server currently only detaches subagents, so for a plain shell command it reports that nothing could be moved and you should use Stop.
 
 ## Password handling
 

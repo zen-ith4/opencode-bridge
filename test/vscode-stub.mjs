@@ -13,6 +13,17 @@ export const window = {
   },
 };
 
+export const workspace = {
+  workspaceFolders: undefined,
+  /** Returns an object whose `get` yields the caller's default value. */
+  getConfiguration() {
+    return { get: (_key, fallback) => fallback };
+  },
+  onDidChangeConfiguration() {
+    return { dispose() {} };
+  },
+};
+
 export const Uri = {
   file(fsPath) {
     return { fsPath, scheme: "file", toString: () => fsPath };
@@ -28,4 +39,4 @@ export const env = {
   },
 };
 
-export default { window, Uri, env };
+export default { window, workspace, Uri, env };

@@ -127,6 +127,13 @@
     fileToken: 0,
     fileQuery: null,
     stopSentAt: 0,
+    settings: {
+      showToolControls: true,
+      textDirection: "auto",
+      fontFamily: "",
+      fontSize: 0,
+      modelLabelMaxWidth: 160,
+    },
   };
 
   var stream = {
@@ -1091,7 +1098,17 @@
     else scrollToBottom();
   }
 
+  /* Keep the button just above whatever sits under the message list (status
+     line + composer), instead of a fixed offset that overlapped the
+     "agent · model" line when the composer grew. */
+  function updateJumpOffset() {
+    var rect = messagesEl.getBoundingClientRect();
+    var gap = Math.max(0, window.innerHeight - rect.bottom);
+    document.documentElement.style.setProperty("--oc-jump-bottom", Math.round(gap + 8) + "px");
+  }
+
   function updateJump() {
+    updateJumpOffset();
     jumpLatest.hidden = stickToBottom() || messagesContentEl.children.length === 0;
   }
 
@@ -1377,9 +1394,33 @@
     body.className = "tool-body";
     body.hidden = true;
     card.appendChild(head);
+    card.appendChild(makeToolActions());
     card.appendChild(body);
     updateToolCard(card, tool);
     return card;
+  }
+
+  /* Stop / background controls. They live OUTSIDE the head button (nested
+     buttons are invalid HTML) and are only visible while the call runs. */
+  function makeToolActions() {
+    var actions = document.createElement("div");
+    actions.className = "tool-actions";
+    actions.hidden = true;
+    var stop = makeEl("button", "tool-action tool-action-stop");
+    stop.type = "button";
+    stop.dataset.toolStop = "1";
+    stop.title = "Stop this command (interrupts the running turn)";
+    stop.appendChild(makeEl("span", "codicon codicon-debug-stop"));
+    stop.appendChild(document.createTextNode(" Stop"));
+    var bg = makeEl("button", "tool-action");
+    bg.type = "button";
+    bg.dataset.toolBackground = "1";
+    bg.title = "Ask OpenCode to move blocking work to the background";
+    bg.appendChild(makeEl("span", "codicon codicon-run-below"));
+    bg.appendChild(document.createTextNode(" Run in background"));
+    actions.appendChild(stop);
+    actions.appendChild(bg);
+    return actions;
   }
 
   function updateToolCard(card, tool) {
@@ -1387,6 +1428,15 @@
     var statusValue = tool.status || "pending";
     card.dataset.status = statusValue;
     card.dataset.kind = tool.kind || inferToolKind(tool.name);
+    var toolActions = card.querySelector(".tool-actions");
+    if (toolActions) {
+      var live = statusValue === "running" || statusValue === "pending";
+      toolActions.hidden = !(live && state.settings.showToolControls);
+      // A fresh click is allowed again once the call changes state.
+      toolActions.querySelectorAll("button").forEach(function (button) {
+        button.disabled = false;
+      });
+    }
     var status = card.querySelector(".tool-status");
     if (status) {
       status.className = "tool-status codicon " + statusGlyph(statusValue);
@@ -2247,6 +2297,24 @@
       return;
     }
 
+    var toolStop = event.target.closest("[data-tool-stop]");
+    if (toolStop) {
+      toolStop.disabled = true;
+      state.stopSentAt = Date.now();
+      post({ type: "stop" });
+      return;
+    }
+
+    var toolBackground = event.target.closest("[data-tool-background]");
+    if (toolBackground) {
+      toolBackground.disabled = true;
+      post({ type: "background" });
+      window.setTimeout(function () {
+        toolBackground.disabled = false;
+      }, 2500);
+      return;
+    }
+
     var openFile = event.target.closest("[data-open-file]");
     if (openFile) {
       post({ type: "openFile", path: openFile.dataset.openFile });
@@ -2353,10 +2421,55 @@
   }
 
   if (typeof ResizeObserver === "function") {
-    var composerObserver = new ResizeObserver(updateToolbarLayout);
+    var composerObserver = new ResizeObserver(function () {
+      updateToolbarLayout();
+      updateJumpOffset();
+    });
     composerObserver.observe(composer);
+    composerObserver.observe(messagesEl);
   }
-  window.addEventListener("resize", updateToolbarLayout);
+  window.addEventListener("resize", function () {
+    updateToolbarLayout();
+    updateJumpOffset();
+  });
+
+  /* UI settings (opencodeBridge.ui.*) ---------------------------------- */
+
+  function applyUiSettings(next) {
+    if (!next || typeof next !== "object") return;
+    var cfg = state.settings;
+    if (typeof next.showToolControls === "boolean") cfg.showToolControls = next.showToolControls;
+    if (next.textDirection === "ltr" || next.textDirection === "rtl" || next.textDirection === "auto") {
+      cfg.textDirection = next.textDirection;
+    }
+    if (typeof next.fontFamily === "string") cfg.fontFamily = next.fontFamily.trim();
+    if (typeof next.fontSize === "number" && isFinite(next.fontSize)) cfg.fontSize = next.fontSize;
+    if (typeof next.modelLabelMaxWidth === "number" && isFinite(next.modelLabelMaxWidth)) {
+      cfg.modelLabelMaxWidth = next.modelLabelMaxWidth;
+    }
+    var root = document.documentElement;
+    document.body.dataset.textDir = cfg.textDirection;
+    // Font family comes from a user setting: only allow characters that can
+    // appear in a font list, so it can never break out of the CSS value.
+    var safeFont = /^[\w\s,.'"\-]+$/.test(cfg.fontFamily) ? cfg.fontFamily : "";
+    if (safeFont) root.style.setProperty("--oc-font", safeFont);
+    else root.style.removeProperty("--oc-font");
+    if (cfg.fontSize >= 8 && cfg.fontSize <= 32) {
+      root.style.setProperty("--oc-font-size", cfg.fontSize + "px");
+    } else {
+      root.style.removeProperty("--oc-font-size");
+    }
+    var labelMax = Math.min(400, Math.max(60, cfg.modelLabelMaxWidth));
+    root.style.setProperty("--oc-model-label-max", labelMax + "px");
+    messagesEl.querySelectorAll(".tool-card").forEach(function (card) {
+      var actions = card.querySelector(".tool-actions");
+      if (!actions) return;
+      var live = card.dataset.status === "running" || card.dataset.status === "pending";
+      actions.hidden = !(live && cfg.showToolControls);
+    });
+    updateToolbarLayout();
+    updateJumpOffset();
+  }
 
   /* Attachments ------------------------------------------------------- */
 
@@ -3018,6 +3131,14 @@
       }
       case "prompt-failed": {
         appendPromptFailure(message.message, message.details);
+        break;
+      }
+      case "ui-settings": {
+        applyUiSettings(message.settings);
+        break;
+      }
+      case "note": {
+        showComposerNote(String(message.text || ""), message.kind || "info");
         break;
       }
       case "connection": {

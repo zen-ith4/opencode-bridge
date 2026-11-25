@@ -557,18 +557,95 @@ export class OpencodeBridgeClient {
     }
   }
 
-  /** Interrupt the active execution for a session (Stop button). */
+  /**
+   * Same server, but outside the `/api` prefix. The legacy (v1) and
+   * experimental routes (`/session/{id}/abort`,
+   * `/experimental/session/{id}/background`) live at the server root.
+   */
+  private rootUrl(): string {
+    return this.baseUrl.replace(/\/api\/?$/, "");
+  }
+
+  private async fetchRootJSON(
+    path: string,
+    options: { method?: string; body?: unknown } = {}
+  ): Promise<unknown> {
+    const headers: Record<string, string> = {};
+    if (this.authHeader) headers.Authorization = this.authHeader;
+    let body: string | undefined;
+    if (options.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      body = JSON.stringify(options.body);
+    }
+    this.debugLog(`fetch ${options.method ?? "GET"} (root) ${path}`);
+    const res = await fetch(this.rootUrl() + path, {
+      method: options.method ?? "GET",
+      headers,
+      ...(body !== undefined ? { body } : {}),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status}: ${snippet(text) || res.statusText}`);
+    }
+    const contentType = res.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) return res.json();
+    return await res.text();
+  }
+
+  /**
+   * Interrupt the active execution for a session (Stop button). This also
+   * kills a shell command that the current turn is waiting on. When the v2
+   * `/api/session/{id}/interrupt` route is rejected (older or newer servers
+   * differ), fall back to the legacy `/session/{id}/abort` route before
+   * giving up, so a failed stop is never silently swallowed.
+   */
   async interrupt(sessionID: string): Promise<void> {
     this.requireClient();
+    const id = encodeURIComponent(sessionID);
     try {
-      await this.fetchJSON(`/session/${encodeURIComponent(sessionID)}/interrupt`, {
-        method: "POST",
-        body: {},
-      });
+      await this.fetchJSON(`/session/${id}/interrupt`, { method: "POST", body: {} });
       this.debugLog(`Session ${sessionID} interrupted`);
+      return;
     } catch (err) {
-      this.debugLog(`interrupt failed: ${errorMessage(err)}`);
-      throw new Error(`Failed to stop OpenCode: ${errorMessage(err)}`);
+      this.debugLog(`interrupt failed (${errorMessage(err)}); trying legacy abort`);
+      if (isAuthError(err)) {
+        throw new Error(`Failed to stop OpenCode: ${errorMessage(err)}`);
+      }
+      try {
+        await this.fetchRootJSON(`/session/${id}/abort`, { method: "POST" });
+        this.debugLog(`Session ${sessionID} aborted via legacy route`);
+        return;
+      } catch (fallbackErr) {
+        this.debugLog(`legacy abort failed: ${errorMessage(fallbackErr)}`);
+        throw new Error(
+          `Failed to stop OpenCode: ${errorMessage(err)} (fallback: ${errorMessage(fallbackErr)})`
+        );
+      }
+    }
+  }
+
+  /**
+   * Ask the server to detach blocking work and keep it running in the
+   * background (`POST /experimental/session/{id}/background`). The server
+   * documents this as detaching synchronous subagents; it answers `true`
+   * when something was detached and `false` when there was nothing to move.
+   */
+  async backgroundSession(sessionID: string): Promise<boolean> {
+    this.requireClient();
+    try {
+      const result = await this.fetchRootJSON(
+        `/experimental/session/${encodeURIComponent(sessionID)}/background`,
+        { method: "POST" }
+      );
+      this.debugLog(`Session ${sessionID} background -> ${JSON.stringify(result)}`);
+      if (typeof result === "boolean") return result;
+      if (result && typeof result === "object" && "data" in result) {
+        return (result as Record<string, unknown>).data === true;
+      }
+      return String(result).trim() === "true";
+    } catch (err) {
+      this.debugLog(`background failed: ${errorMessage(err)}`);
+      throw new Error(`Failed to move work to the background: ${errorMessage(err)}`);
     }
   }
 

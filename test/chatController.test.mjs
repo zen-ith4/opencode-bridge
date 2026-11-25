@@ -85,6 +85,13 @@ class FakeClient {
 
   async interrupt(sessionID) {
     this.interrupts.push(sessionID);
+    if (this.interruptError) throw new Error(this.interruptError);
+  }
+
+  async backgroundSession(sessionID) {
+    this.backgrounds = (this.backgrounds || []).concat(sessionID);
+    if (this.backgroundError) throw new Error(this.backgroundError);
+    return this.backgroundResult ?? true;
   }
 
   async streamEvents({ signal, onEvent }) {
@@ -953,6 +960,45 @@ test("write/edit tool calls and step files produce files-changed", async () => {
     const files = byType(posts, "files-changed");
     assert.ok(files.length >= 1);
     assert.deepEqual(files.at(-1).files, ["src/new.ts"]);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("a failed interrupt is reported with a retry action instead of a silent log", async () => {
+  const { client, posts, controller } = makeController({
+    options: { sessionID: "ses_stop", getResponseTimeoutSeconds: () => 0.05 },
+  });
+  try {
+    client.interruptError = "HTTP 500: boom";
+    await controller.handleMessage({ type: "send", text: "run a shell command" });
+    await controller.handleMessage({ type: "stop" });
+    assert.deepEqual(client.interrupts, ["ses_stop"]);
+    const banners = byType(posts, "banner").filter((m) => m.banner);
+    const last = banners.at(-1).banner;
+    assert.match(last.message, /did not confirm the stop/);
+    assert.ok(last.actions.some((a) => a.id === "retry-stop"));
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("background reports honestly whether the server detached anything", async () => {
+  const { client, posts, controller } = makeController({
+    options: { sessionID: "ses_bg", getResponseTimeoutSeconds: () => 0.05 },
+  });
+  try {
+    await controller.handleMessage({ type: "send", text: "long task" });
+    client.backgroundResult = false;
+    await controller.handleMessage({ type: "background" });
+    assert.deepEqual(client.backgrounds, ["ses_bg"]);
+    const notes = byType(posts, "note");
+    assert.equal(notes.at(-1).kind, "warning");
+    assert.match(notes.at(-1).text, /nothing to detach/i);
+
+    client.backgroundResult = true;
+    await controller.handleMessage({ type: "background" });
+    assert.equal(byType(posts, "note").at(-1).kind, "info");
   } finally {
     controller.dispose();
   }
